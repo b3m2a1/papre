@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "papre"
-version = "0.3.0"
+version = "0.3.2"
 description = "Paper Patch Review Editor: review and edit LaTeX patches before applying them"
 readme = "README.md"
 requires-python = ">=3.11"

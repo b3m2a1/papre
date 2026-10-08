@@ -202,8 +202,10 @@ async function showSource(path) {
 }
 $('#back-review').addEventListener('click', () => { sourcePath = null; renderReview(); renderNav(); });
 
-async function browseDirectory(path) {
-  directory = await api('/api/directories' + (path ? '?path=' + encodeURIComponent(path) : ''));
+let directoryGeneration = 0;
+function renderDirectory(listing) {
+  directory = listing;
+  $('#repo-error').hidden = true;
   $('#directory-path').value = directory.path; $('#directory-up').disabled = !directory.parent;
   $('#attach-repo').disabled = !directory.is_repo;
   $('#directory-status').textContent = directory.is_repo ? 'This directory is a Git repository. Attaching creates review_queue, processed, and superseded if needed.' : 'Open a directory containing a Git repository.';
@@ -214,23 +216,45 @@ async function browseDirectory(path) {
   }
   if (!directory.directories.length) $('#directory-list').append(node('p', 'sidebar-empty', 'No subdirectories.'));
 }
+async function browseDirectory(path) {
+  const generation = ++directoryGeneration;
+  $('#attach-repo').disabled = true;
+  const listing = await api('/api/directories' + (path ? '?path=' + encodeURIComponent(path) : ''));
+  if (generation === directoryGeneration) renderDirectory(listing);
+}
 function repoError(message) { $('#repo-error').textContent = message; $('#repo-error').hidden = false; }
 async function chooseRepo() {
   if (!safeNavigate()) return;
   $('#repo-error').hidden = true; $('#repo-write').checked = session.allow_write;
-  $('#repo-dialog').showModal(); await browseDirectory(session.repo?.root || session.browse_root);
+  $('#repo-dialog').showModal(); await browseDirectory(session.repo?.root || session.browse_start || session.browse_root);
 }
 $('#choose-repo').addEventListener('click', () => chooseRepo().catch(error => repoError(error.message)));
 $('#directory-go').addEventListener('click', () => browseDirectory($('#directory-path').value).catch(error => repoError(error.message)));
+$('#directory-picker').addEventListener('click', async () => {
+  $('#directory-picker').disabled = true;
+  $('#directory-picker').label = 'Picker open…'; $('#repo-error').hidden = true;
+  try {
+    const result = await api('/api/directory-picker', {path: directory?.path || session.browse_start});
+    if (!result.cancelled) { directoryGeneration++; renderDirectory(result.directory); }
+  } catch (error) {
+    $('#directory-navigation').open = true; repoError(error.message);
+  } finally { $('#directory-picker').disabled = false; $('#directory-picker').label = 'Browse…'; }
+});
+$('#directory-path').addEventListener('input', () => {
+  directoryGeneration++;
+  $('#attach-repo').disabled = !directory?.is_repo || $('#directory-path').value !== directory.path;
+});
 $('#directory-path').addEventListener('keydown', event => { if (event.key === 'Enter') $('#directory-go').click(); });
 $('#directory-up').addEventListener('click', () => browseDirectory(directory.parent).catch(error => repoError(error.message)));
 $('#attach-repo').addEventListener('click', async () => {
+  if (!directory?.is_repo || $('#directory-path').value !== directory.path) return;
   queueGeneration++;
   $('#attach-repo').disabled = true; $('#repo-error').hidden = true;
   try {
     session = await api('/api/repository', {path: directory.path, allow_write: $('#repo-write').checked});
     entry = proposal = sourcePath = lastBuild = null; buildGeneration++; drafts.clear(); editing.clear(); expanded.clear();
     $('#pdf-pages').hidden = $('#pdf-frame').hidden = $('#open-pdf').hidden = $('#pdf-zoom-control').hidden = true;
+    $('#build-warning').hidden = true;
     $('#pdf-empty').hidden = false; $('#build-badge').textContent = 'Not compiled'; $('#compile').label = 'Compile preview';
     $('#repo-dialog').close(); await refreshSession();
     const first = activeEntries()[0]; if (first) await openEntry(first.id); else renderReview();
@@ -310,10 +334,11 @@ $('#pdf-zoom').addEventListener('change', () => {
 $('#compile').addEventListener('click', async () => {
   if (drafts.size) { toast('Save or cancel the update edit before compiling.', true); return; }
   const generation = ++buildGeneration; $('#compile').disabled = true; $('#compile').label = 'Compiling…'; $('#build-badge').textContent = 'Compiling';
+  $('#build-warning').hidden = true;
   $('#pdf-pages').hidden = $('#pdf-frame').hidden = $('#open-pdf').hidden = $('#pdf-zoom-control').hidden = true; $('#pdf-empty').hidden = false;
   try {
     const job = await api('/api/previews', {main: $('#main-file').value, engine: $('#engine').value,
-      selection: $('#preview-selection').value, proposal: proposal?.id, revision: proposal?.revision});
+      selection: $('#preview-selection').value, proposal: proposal?.id, revision: proposal?.revision, strict: $('#compile-strict').checked});
     await pollBuild(job.id, generation);
   } catch (error) {
     if (generation !== buildGeneration) return;
@@ -326,8 +351,12 @@ async function pollBuild(id, generation) {
     $('#build-log').textContent = job.log;
     if (job.status === 'running') { await new Promise(resolve => setTimeout(resolve, 800)); continue; }
     lastBuild = job;
-    if (job.status === 'succeeded') {
-      $('#build-badge').textContent = `${job.seconds}s · Ready`;
+    if (job.status === 'succeeded' || job.status === 'with_errors') {
+      $('#build-badge').textContent = job.status === 'with_errors' ? 'Preview with errors' : `${job.seconds}s · Ready`;
+      if (job.status === 'with_errors') {
+        $('#build-warning').textContent = (job.error ? job.error + ' ' : '') + 'LaTeX reported errors. This preview may be incomplete; check the log.';
+        $('#build-warning').hidden = false; $('#build-log').hidden = false; $('#toggle-log').label = 'Hide log';
+      }
       if (job.pages?.length) {
         $('#pdf-pages').replaceChildren();
         job.pages.forEach((url, index) => { const figure = node('figure', 'pdf-page'), image = node('img');
@@ -337,7 +366,11 @@ async function pollBuild(id, generation) {
       } else { $('#pdf-frame').src = job.pdf; $('#pdf-frame').hidden = false; }
       $('#pdf-empty').hidden = true; $('#open-pdf').href = job.pdf; $('#open-pdf').hidden = false;
       if (job.selection !== 'working' && (proposal?.id !== job.proposal || proposal?.revision !== job.revision)) previewStale();
-    } else { $('#build-badge').textContent = 'Build failed'; $('#build-log').hidden = false; $('#toggle-log').label = 'Hide log'; toast('Compilation failed. See the log.', true); }
+    } else {
+      $('#build-badge').textContent = 'Build failed'; $('#build-log').hidden = false; $('#toggle-log').label = 'Hide log';
+      $('#build-warning').textContent = job.error || 'LaTeX produced no new PDF. Check the compilation log.';
+      $('#build-warning').hidden = false; toast('Compilation failed. See the log.', true);
+    }
     return;
   }
 }

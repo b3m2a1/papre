@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -14,6 +15,30 @@ import uuid
 
 from .core import ReviewError, ReviewStore, timestamp
 from .system import ENGINES, available_tools
+
+
+def complete_pdf(path: Path) -> bool:
+    """Only expose a PDF from this build after the engine has finished writing it."""
+    try:
+        with path.open("rb") as stream:
+            if not stream.read(8).startswith(b"%PDF-"):
+                return False
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - 1024))
+            return b"%%EOF" in stream.read()
+    except OSError:
+        return False
+
+
+def compile_diagnostics(log: str) -> dict:
+    missing = list(dict.fromkeys(re.findall(r"(?:LaTeX Error: File|Missing input file:)\s*[`'\"]([^`'\"]+\.(?:sty|cls))[`'\"]", log)))
+    if missing:
+        error = "Required LaTeX package or class not found: " + ", ".join(missing) + ". Check your TeX installation and the manuscript's package requirements."
+    else:
+        error = next((line.strip() for line in log.splitlines() if "LaTeX Error:" in line or "Undefined control sequence" in line or
+                      ("Package " in line and " Error:" in line)), "")
+    return {"error": error, "missing_packages": missing}
 
 
 def stop_process_tree(process):
@@ -47,7 +72,9 @@ class PreviewManager:
     def available() -> dict:
         return available_tools()
 
-    def start(self, main: str, engine: str, selection: str, proposal_id: str | None, revision: int | None) -> dict:
+    def start(self, main: str, engine: str, selection: str, proposal_id: str | None, revision: int | None, strict: bool = False) -> dict:
+        if not isinstance(strict, bool):
+            raise ReviewError("Stop on first error must be true or false.")
         if engine not in ENGINES:
             raise ReviewError("Unsupported LaTeX engine.")
         if selection not in {"working", "proposed", "accepted"}:
@@ -96,6 +123,7 @@ class PreviewManager:
                 raise
             job = {"id": job_id, "status": "running", "main": main, "engine": engine,
                    "selection": selection, "proposal": proposal_id, "revision": revision,
+                   "strict": strict, "engine_path": tools["engine_paths"][engine], "latexmk_path": tools["latexmk"],
                    "created": timestamp(), "warnings": warnings, "log": "Preparing LaTeX preview…"}
             self.jobs[job_id] = job
             self.running = True
@@ -116,31 +144,37 @@ class PreviewManager:
         output.mkdir()
         env = dict(os.environ)
         env.update(openin_any="p", openout_any="p", TEXMFOUTPUT=str(output))
-        command = [shutil.which("latexmk"), "-norc", ENGINES[job["engine"]], "-no-shell-escape",
-                   "-interaction=nonstopmode", "-halt-on-error", "-file-line-error",
+        command = [job["latexmk_path"], "-norc", ENGINES[job["engine"]], "-no-shell-escape",
+                   "-interaction=nonstopmode", "-halt-on-error" if job["strict"] else "-f", "-file-line-error",
                    "-outdir=" + str(output), "./" + job["main"]]
         started = time.monotonic()
         try:
             with (folder / "compile.log").open("wb") as log:
                 process = subprocess.Popen(command, cwd=folder / "source", env=env,
-                                           stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                                           stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 try:
                     code = process.wait(timeout=self.timeout)
                 except subprocess.TimeoutExpired:
                     stop_process_tree(process)
                     raise ReviewError(f"Compilation exceeded {self.timeout} seconds.")
             pdf = output / (Path(job["main"]).stem + ".pdf")
-            status = "succeeded" if code == 0 and pdf.is_file() else "failed"
-            pages = self._render_pages(job, pdf) if status == "succeeded" else []
             content = (folder / "compile.log").read_text(encoding="utf-8", errors="replace")
+            diagnostics = compile_diagnostics(content)
+            has_pdf = complete_pdf(pdf)
+            status = ("succeeded" if code == 0 and not diagnostics["error"] else "with_errors") if has_pdf else "failed"
+            if status == "with_errors":
+                job["warnings"].append("LaTeX reported errors. This PDF may contain incomplete content or incorrect formatting. Read the compilation log.")
+            pages = self._render_pages(job, pdf) if has_pdf else []
             with self.lock:
                 job.update(status=status, log=content[-100000:], seconds=round(time.monotonic() - started, 2),
                            pages=pages,
-                           pdf="/api/previews/" + job_id + "/pdf" if status == "succeeded" else None)
+                           exit_code=code, **diagnostics,
+                           pdf="/api/previews/" + job_id + "/pdf" if has_pdf else None)
         except Exception as exc:
             with self.lock:
                 partial = (folder / "compile.log").read_text(errors="replace") if (folder / "compile.log").exists() else ""
-                job.update(status="failed", log=partial[-90000:] + "\n" + str(exc), pdf=None)
+                job.update(status="failed", log=partial[-90000:] + "\n" + str(exc), pdf=None,
+                           **(compile_diagnostics(partial) | {"error": str(exc)}))
         finally:
             with self.lock:
                 self.running = False
@@ -202,12 +236,12 @@ class PreviewManager:
 
     def pdf(self, job_id: str) -> Path:
         job = self.get(job_id)
-        if job["status"] != "succeeded":
-            raise ReviewError("This build has no successful PDF.", 404)
+        if job["status"] not in {"succeeded", "with_errors"}:
+            raise ReviewError("This build produced no preview PDF.", 404)
         return self.root / job_id / "output" / (Path(job["main"]).stem + ".pdf")
 
     def page(self, job_id: str, number: str) -> Path:
         job = self.get(job_id)
-        if job["status"] != "succeeded" or not number.isdigit() or not 1 <= int(number) <= len(job.get("pages", [])):
+        if job["status"] not in {"succeeded", "with_errors"} or not number.isdigit() or not 1 <= int(number) <= len(job.get("pages", [])):
             raise ReviewError("Preview page not found.", 404)
         return self.root / job_id / "pages" / f"page-{int(number)}.png"

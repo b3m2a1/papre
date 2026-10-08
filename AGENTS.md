@@ -60,7 +60,9 @@ queue when that location and action are authorized by the user's request.
 - Apply changes only accepted source text, leaves Git's index unchanged, and
   refuses a stale baseline. Undo refuses to overwrite subsequent edits.
 - PDF compilation uses a separate snapshot. Exclude queue artifacts from previews;
-  retain disabled shell escape, compiler timeouts, and failed-build checks.
+  retain disabled shell escape and compiler timeouts. A new PDF from an errored
+  build is allowed as an explicitly marked error preview, never as a clean success.
+  Reject incomplete outputs and never reuse a manuscript PDF as a failed build's output.
 - Preserve path and symlink guards, loopback binding, request-token and origin
   checks, repository identity checks, durable decisions, and revision guards.
 - Render source and patch content as text, never as trusted HTML.
@@ -71,6 +73,8 @@ queue when that location and action are authorized by the user's request.
 - `papre/queue.py`: discovery, enqueue, version backups, processing, and receipts.
 - `papre/preview.py`: compilation snapshots, logs, PDFs, and page rendering.
 - `papre/server.py`: HTTP API, repository picker, and launch configuration.
+- `papre/picker.py`: native operating-system folder selection; keep HTTP token checks,
+  explicit `--browse-root` restrictions, cancellation, and the in-page fallback.
 - `papre/static/`: shared UI components and browser workflow.
 - `tests/`: disposable-repository tests and optional browser verification.
 

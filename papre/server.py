@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 from .core import Repository, ReviewError, ReviewStore, run_git
 from .preview import PreviewManager
 from .queue import PatchQueue
+from .picker import pick_directory
 from .system import default_state_dir, print_tool_status
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,11 +36,13 @@ Requested changes: [describe the edit here]
 class ReviewHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, store=None, main="main.tex", demo=False, browse_root=None, state_base=None):
+    def __init__(self, address, store=None, main="main.tex", demo=False, browse_root=None, state_base=None, browse_start=None):
         self.stores = []
         super().__init__(address, Handler)
         self.lock = threading.RLock()
-        self.browse_root = Path(browse_root or Path.cwd()).resolve()
+        self.browse_root = Path(browse_root).expanduser().resolve() if browse_root else None
+        self.browse_start = Path(browse_start or self.browse_root or (store.repo.root if store else Path.cwd())).expanduser().resolve()
+        self.picker_lock = threading.Lock()
         self.state_base = Path(state_base or default_state_dir()).resolve()
         self.store = store
         self.queue = PatchQueue(store) if store else None
@@ -51,22 +54,36 @@ class ReviewHTTPServer(ThreadingHTTPServer):
         self.token = secrets.token_urlsafe(32)
 
     def browse(self, value=None):
-        path = Path(value or self.browse_root).resolve()
-        if not path.is_relative_to(self.browse_root) or not path.is_dir():
+        path = Path(value or self.browse_start).expanduser().resolve()
+        if self.browse_root and not path.is_relative_to(self.browse_root):
             raise ReviewError("Choose a directory inside the configured browser root.")
+        if not path.is_dir():
+            raise ReviewError("This directory does not exist or is not accessible.")
         try:
             children = sorted((p for p in path.iterdir() if p.is_dir() and not p.is_symlink() and not p.name.startswith(".")),
                               key=lambda p: p.name.casefold())
         except OSError as exc:
             raise ReviewError("Cannot read this directory.") from exc
-        return {"path": str(path), "parent": str(path.parent) if path != self.browse_root else None,
-                "is_repo": (path / ".git").exists(), "root": str(self.browse_root),
+        return {"path": str(path), "parent": str(path.parent) if path not in (self.browse_root, path.parent) else None,
+                "is_repo": (path / ".git").exists(), "root": str(self.browse_root) if self.browse_root else None,
                 "directories": [{"name": p.name, "path": str(p), "is_repo": (p / ".git").exists()} for p in children[:500]]}
+
+    def choose_directory(self, value=None):
+        if value is not None and not isinstance(value, str):
+            raise ReviewError("Invalid directory path.")
+        start = Path(self.browse(value)["path"])
+        if not self.picker_lock.acquire(blocking=False):
+            raise ReviewError("A folder picker is already open. Finish that selection first.", 409)
+        try:
+            selected = pick_directory(start)
+            return {"cancelled": selected is None, "directory": self.browse(str(selected)) if selected else None}
+        finally:
+            self.picker_lock.release()
 
     def attach(self, path, allow_write=False, main="main.tex"):
         if not isinstance(path, str) or not isinstance(allow_write, bool) or not isinstance(main, str):
             raise ReviewError("Invalid repository selection.")
-        chosen = Path(path).resolve()
+        chosen = Path(path).expanduser().resolve()
         self.browse(str(chosen))
         repo = Repository(chosen)
         key = hashlib.sha256(str(repo.root).encode()).hexdigest()[:16]
@@ -93,7 +110,8 @@ class ReviewHTTPServer(ThreadingHTTPServer):
             return {"token": self.token, "repo": store.repo.status() if store else None,
                     "repo_key": hashlib.sha256(str(store.repo.root).encode()).hexdigest() if store else None,
                     "files": files, "main": main, "allow_write": store.allow_write if store else False,
-                    "demo": self.demo, "browse_root": str(self.browse_root), "compiler": PreviewManager.available(),
+                    "demo": self.demo, "browse_root": str(self.browse_root) if self.browse_root else None,
+                    "browse_start": str(self.browse_start), "compiler": PreviewManager.available(),
                     "queue": self.queue.list() if self.queue else {"entries": [], "archives": []},
                     "proposals": store.list() if store else []}
 
@@ -230,6 +248,8 @@ class Handler(BaseHTTPRequestHandler):
             data = self.body()
             path = urlsplit(self.path).path
             store = self.server.store
+            if path == "/api/directory-picker":
+                return self.send(self.server.choose_directory(data.get("path")))
             if path == "/api/repository":
                 return self.send(self.server.attach(data.get("path"), data.get("allow_write", False), data.get("main", "main.tex")))
             if not store:
@@ -272,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send({"text": text})
             if path == "/api/previews":
                 return self.send(self.server.previews.start(data.get("main", ""), data.get("engine", "pdflatex"),
-                                 data.get("selection", "working"), data.get("proposal"), data.get("revision")), 202)
+                                 data.get("selection", "working"), data.get("proposal"), data.get("revision"), data.get("strict", False)), 202)
             if path.startswith("/api/proposals/"):
                 parts = path.split("/")
                 if len(parts) != 5:
@@ -330,7 +350,7 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--allow-write", action="store_true", help="Enable explicit Apply and Undo actions")
     parser.add_argument("--state-dir", type=Path, help="Parent of review state folders, outside the manuscript repository")
-    parser.add_argument("--browse-root", type=Path, help="Directory browser boundary; defaults to the launch directory or the selected repository's parent")
+    parser.add_argument("--browse-root", type=Path, help="Optional boundary for repository selection; by default any local directory is accessible")
     parser.add_argument("--check", action="store_true", help="Report available Git, LaTeX engines, and PDF tools without starting a server")
     args = parser.parse_args()
     if args.check:
@@ -347,15 +367,14 @@ def main():
             state = state_base / "repositories" / key
             store = ReviewStore(repo, state, args.allow_write or args.demo)
             store.recover()
-        browse_root = args.browse_root.expanduser() if args.browse_root else store.repo.root.parent if store else Path.cwd()
         server = ReviewHTTPServer(("127.0.0.1", args.port), store, args.main, args.demo,
-                                  browse_root, state_base)
+                                  args.browse_root, state_base)
         if args.demo and not server.queue.list()["entries"]:
             server.queue.enqueue((DEMO / "example.patch").read_text(), "Example manuscript edits")
     except (ReviewError, OSError) as exc:
         parser.exit(1, f"Could not start: {exc}\n")
     print(f"Paper Patch Review Editor: http://127.0.0.1:{server.server_port}", flush=True)
-    print(f"Repository: {store.repo.root if store else 'Choose in browser'}\nBrowser root: {server.browse_root}", flush=True)
+    print(f"Repository: {store.repo.root if store else 'Choose in browser'}\nBrowser boundary: {server.browse_root or 'unrestricted'}", flush=True)
     compiler = PreviewManager.available()
     print("LaTeX engines: " + (", ".join(compiler["engines"]) or "none detected") +
           "; latexmk: " + ("available" if compiler["latexmk"] else "not found"), flush=True)

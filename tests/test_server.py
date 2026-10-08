@@ -6,8 +6,10 @@ import time
 import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from urllib.parse import quote
+from unittest.mock import patch
 
-from papre.core import Repository, ReviewStore, git_patch, run_git
+from papre.core import Repository, ReviewError, ReviewStore, git_patch, run_git
 from papre.preview import PreviewManager
 from papre.server import ROOT, ReviewHTTPServer
 
@@ -105,7 +107,7 @@ class ServerTests(unittest.TestCase):
                                                    "replace": "\\ThisCommandDoesNotExist"}]})
         bad = self.post(f"/api/queue/{queued['id']}/open", {})["proposal"]
         job = self.post("/api/previews", {"main": "main.tex", "engine": "pdflatex", "selection": "proposed",
-                                         "proposal": bad["id"], "revision": bad["revision"]})
+                                         "proposal": bad["id"], "revision": bad["revision"], "strict": True})
         job = self.wait_preview(job)
         self.assertEqual(job["status"], "failed")
         self.assertIn("Undefined control sequence", job["log"])
@@ -114,6 +116,35 @@ class ServerTests(unittest.TestCase):
             urlopen(self.url + "/api/previews/" + job["id"] + "/pdf")
         self.assertEqual(caught.exception.code, 404)
         self.assertEqual((self.repo_path / "main.tex").read_text(), self.base)
+
+    @unittest.skipUnless(PreviewManager.available()["latexmk"] and "pdflatex" in PreviewManager.available()["engines"], "LaTeX unavailable")
+    def test_recoverable_errors_still_serve_a_new_pdf_and_missing_packages_do_not(self):
+        source = self.repo_path / "main.tex"
+        source.write_text(self.base.replace("Original manuscript.", "Original manuscript.\\ThisCommandDoesNotExist\nMore text."))
+        job = self.wait_preview(self.post("/api/previews", {"main": "main.tex", "selection": "working"}))
+        self.assertEqual(job["status"], "with_errors", job["log"])
+        self.assertFalse(job["strict"])
+        self.assertNotEqual(job["exit_code"], 0)
+        self.assertIn("Undefined control sequence", job["error"])
+        self.assertTrue(job["warnings"])
+        with urlopen(self.url + job["pdf"]) as response:
+            self.assertTrue(response.read().startswith(b"%PDF"))
+        if job["pages"]:
+            with urlopen(self.url + job["pages"][0]) as response:
+                self.assertTrue(response.read().startswith(b"\x89PNG"))
+        # A project PDF from an earlier compile cannot become this build's output.
+        (self.repo_path / "main.pdf").write_bytes(b"%PDF-1.5\nold document\n%%EOF\n")
+        source.write_text(self.base.replace("\\begin{document}", "\\usepackage{papre-package-that-does-not-exist}\n\\begin{document}"))
+        job = self.wait_preview(self.post("/api/previews", {"main": "main.tex", "selection": "working"}))
+        self.assertEqual(job["status"], "failed", job["log"])
+        self.assertEqual(job["missing_packages"], ["papre-package-that-does-not-exist.sty"])
+        self.assertIn("Required LaTeX package", job["error"])
+        self.assertIsNone(job["pdf"])
+        with self.assertRaises(HTTPError):
+            urlopen(self.url + "/api/previews/" + job["id"] + "/pdf")
+        with self.assertRaises(HTTPError) as caught:
+            self.post("/api/previews", {"main": "main.tex", "strict": "false"})
+        self.assertEqual(caught.exception.code, 400)
 
     def test_directory_browser_attach_and_token_rotation(self):
         listing = self.get("/api/directories")
@@ -134,6 +165,58 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             self.post("/api/import", {"patch": "invalid"}, token=old_token)
         self.assertEqual(caught.exception.code, 403)
+
+    def test_unrestricted_browser_can_leave_launch_directory_and_expand_home(self):
+        with patch("papre.server.Path.cwd", return_value=self.repo_path):
+            server = ReviewHTTPServer(("127.0.0.1", 0), state_base=self.root / "states")
+        try:
+            self.assertIsNone(server.session()["browse_root"])
+            self.assertEqual(server.browse()["parent"], str(self.root))
+            self.assertEqual(server.browse(str(self.root))["path"], str(self.root))
+            with patch.dict("os.environ", {"HOME": str(self.root), "USERPROFILE": str(self.root)}):
+                self.assertEqual(server.browse("~/repo")["path"], str(self.repo_path))
+                session = server.attach("~/repo")
+                self.assertEqual(session["repo"]["root"], str(self.repo_path))
+            self.assertIsNone(server.browse(str(self.root.anchor))["parent"])
+        finally:
+            server.server_close()
+
+    def test_typed_home_path_and_missing_directory(self):
+        with patch.dict("os.environ", {"HOME": str(self.root), "USERPROFILE": str(self.root)}):
+            listing = self.get("/api/directories?path=" + quote("~/repo"))
+        self.assertEqual(listing["path"], str(self.repo_path))
+        with self.assertRaises(HTTPError) as caught:
+            self.get("/api/directories?path=" + quote(str(self.root / "missing")))
+        self.assertIn("does not exist", json.load(caught.exception)["error"])
+
+    @patch("papre.server.pick_directory")
+    def test_native_picker_validation_cancel_and_token_guard(self, picker):
+        picker.return_value = self.repo_path
+        result = self.post("/api/directory-picker", {"path": str(self.root)})
+        self.assertEqual(result["directory"]["path"], str(self.repo_path))
+        self.assertFalse(result["cancelled"])
+        self.assertEqual(self.server.store, self.store)
+        picker.assert_called_once_with(self.root)
+        picker.return_value = None
+        self.assertTrue(self.post("/api/directory-picker", {})["cancelled"])
+        picker.return_value = Path(self.root.anchor)
+        with self.assertRaises(HTTPError) as caught:
+            self.post("/api/directory-picker", {})
+        self.assertEqual(caught.exception.code, 400)
+        with self.assertRaises(HTTPError) as caught:
+            self.post("/api/directory-picker", {}, token="invalid")
+        self.assertEqual(caught.exception.code, 403)
+        self.server.picker_lock.acquire()
+        try:
+            with self.assertRaises(HTTPError) as caught:
+                self.post("/api/directory-picker", {})
+            self.assertEqual(caught.exception.code, 409)
+        finally:
+            self.server.picker_lock.release()
+        picker.side_effect = ReviewError("Picker unavailable", 503)
+        with self.assertRaises(HTTPError) as caught:
+            self.post("/api/directory-picker", {})
+        self.assertEqual(caught.exception.code, 503)
 
 
 if __name__ == "__main__":

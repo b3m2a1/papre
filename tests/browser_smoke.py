@@ -4,12 +4,13 @@ import shutil
 import sys
 import tempfile
 import threading
+from unittest.mock import patch
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
 from playwright.sync_api import sync_playwright, expect
-from papre.core import run_git
+from papre.core import ReviewError, run_git
 from papre.server import DEMO, ROOT, ReviewHTTPServer
 
 
@@ -24,6 +25,8 @@ def main():
         repo_path.mkdir()
         for name in ["main.tex", "references.bib", ".gitignore"]:
             shutil.copyfile(DEMO / name, repo_path / name)
+        (repo_path / "error-preview.tex").write_text("\\documentclass{article}\n\\begin{document}\nA recoverable error: \\PapreUnknownCommand.\nThe preview still contains this text.\n\\end{document}\n")
+        (repo_path / "missing-package.tex").write_text("\\documentclass{article}\n\\usepackage{papre-missing-package}\n\\begin{document}\nNo preview.\n\\end{document}\n")
         for args in [("init",), ("symbolic-ref", "HEAD", "refs/heads/main"), ("add", "."),
                      ("-c", "user.name=QA", "-c", "user.email=qa@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "demo")]:
             result = run_git(repo_path, *args)
@@ -31,7 +34,9 @@ def main():
         before = (repo_path / "main.tex").read_text()
         original_patch = (DEMO / "example.patch").read_text()
         queue = repo_path / "review_queue"
-        server = ReviewHTTPServer(("127.0.0.1", 0), browse_root=base, state_base=base / "state")
+        launch = base / "app-launch-directory"
+        launch.mkdir()
+        server = ReviewHTTPServer(("127.0.0.1", 0), browse_start=launch, state_base=base / "state")
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -45,7 +50,30 @@ def main():
                 expect(page).to_have_title("Paper Patch Review Editor")
                 expect(page.locator("#repo-dialog dialog")).to_be_visible()
                 page.screenshot(path=str(qa / "directory-picker.png"))
+                with patch("papre.server.pick_directory", return_value=None):
+                    page.get_by_role("button", name="Browse…", exact=True).click()
+                    expect(page.get_by_role("button", name="Browse…", exact=True)).to_be_enabled()
+                assert not queue.exists()
+                with patch("papre.server.pick_directory", side_effect=ReviewError("System picker unavailable", 503)):
+                    page.get_by_role("button", name="Browse…", exact=True).click()
+                    expect(page.locator("#repo-error")).to_contain_text("System picker unavailable")
+                # Leaving the launch folder must be possible without a browser-root option.
+                expect(page.get_by_role("button", name="Up", exact=True)).to_be_enabled()
+                page.get_by_role("button", name="Up", exact=True).click()
                 page.locator("#directory-list").get_by_role("button", name="manuscript Git repository").click()
+                expect(page.get_by_role("button", name="Attach repository", exact=True)).to_be_enabled()
+                page.locator("#directory-path").fill(str(base / "missing"))
+                expect(page.get_by_role("button", name="Attach repository", exact=True)).to_be_disabled()
+                page.get_by_role("button", name="Go", exact=True).click()
+                expect(page.locator("#repo-error")).to_contain_text("does not exist")
+                page.locator("#directory-path").fill(str(launch))
+                page.get_by_role("button", name="Go", exact=True).click()
+                expect(page.locator("#repo-error")).not_to_be_visible()
+                with patch("papre.server.pick_directory", return_value=repo_path):
+                    page.get_by_role("button", name="Browse…", exact=True).click()
+                    expect(page.locator("#directory-path")).to_have_value(str(repo_path))
+                assert not queue.exists()
+                page.screenshot(path=str(qa / "directory-picker-fallback.png"))
                 page.locator("#repo-write").check()
                 page.get_by_role("button", name="Attach repository", exact=True).click()
                 expect(page.locator("#repo-dialog dialog")).not_to_be_visible()
@@ -133,6 +161,33 @@ def main():
                 page.get_by_role("button", name="Undo apply", exact=True).click()
                 expect(page.locator("#apply-summary")).to_have_text("Apply undone")
                 assert (repo_path / "main.tex").read_text() == before
+
+                # Recoverable errors display a fresh PDF, while missing packages cannot.
+                page.locator("#preview-selection").select_option("working")
+                page.locator("#main-file").select_option("error-preview.tex")
+                expect(page.locator("#compile-strict")).not_to_be_checked()
+                page.get_by_role("button", name="Compile preview", exact=True).click()
+                expect(page.locator("#build-badge")).to_have_text("Preview with errors", timeout=45000)
+                expect(page.locator("#build-warning")).to_contain_text("preview may be incomplete")
+                expect(page.locator("#build-log")).to_be_visible()
+                expect(page.locator("#pdf-pages img").first).to_be_visible()
+                response = context.request.get(f"http://127.0.0.1:{server.server_port}" + page.locator("#open-pdf").get_attribute("href"))
+                assert response.body().startswith(b"%PDF")
+                page.screenshot(path=str(qa / "preview-with-errors.png"), full_page=True)
+                page.locator("#compile-strict").check()
+                page.get_by_role("button", name="Compile preview", exact=True).click()
+                expect(page.locator("#build-badge")).to_have_text("Build failed", timeout=45000)
+                expect(page.locator("#open-pdf")).not_to_be_visible()
+                page.locator("#compile-strict").uncheck()
+                page.locator("#main-file").select_option("missing-package.tex")
+                page.get_by_role("button", name="Compile preview", exact=True).click()
+                expect(page.locator("#build-badge")).to_have_text("Build failed", timeout=45000)
+                expect(page.locator("#build-warning")).to_contain_text("papre-missing-package.sty")
+                expect(page.locator("#open-pdf")).not_to_be_visible()
+                page.locator("#main-file").select_option("main.tex")
+                page.get_by_role("button", name="Compile preview", exact=True).click()
+                expect(page.locator("#build-badge")).to_contain_text("Ready", timeout=45000)
+                expect(page.locator("#build-warning")).not_to_be_visible()
 
                 # Skip keeps a file queued; invalid context shows the Archive warning.
                 import_patch("Later", original_patch)

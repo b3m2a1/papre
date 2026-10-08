@@ -33,7 +33,11 @@ Open the HTTP address printed by the running app, rather than opening `papre/sta
 
 ## Choose a repository
 
-**Choose repository** opens a directory browser. Navigate into the root of your manuscript's Git repository and click **Attach repository**, or enter its directory path and click **Browse**. The browser starts within the directory from which you launched the app. Use `--browse-root` to select a different boundary.
+Click **Choose repository**, then **Browse…** to open your operating system's folder picker. Select the root of your manuscript's Git repository and click **Attach repository**. You can also enter a path (including `~` for your home directory) and click **Go** or press Enter. **Browse folders in this page** provides a fallback with folder navigation and an **Up** button.
+
+The picker starts at the attached repository or the app's launch directory. It can navigate to other local directories by default. Use `--browse-root /path/to/folder` only when you want to restrict repository selection to that folder and its descendants; the restriction applies to both pickers. Choosing a folder does not attach it or create queue folders until you click **Attach repository**.
+
+The native dialog uses macOS's folder chooser or Windows's folder dialog. On Linux it uses Zenity, KDialog, or Python's optional Tk support, when available. If a desktop picker is unavailable (for example, on a server without a graphical desktop), enter the path or use the in-page browser. No extra Python dependency is required for patch review.
 
 Attaching creates `review_queue`, `review_queue/processed`, and `review_queue/superseded` if needed. Check **Enable Apply and Undo** when you want those buttons to change manuscript source. Importing, editing, and reviewing write queue artifacts and review state; manuscript source changes only when you explicitly click **Apply accepted changes** or **Undo apply**. The app does not stage, commit, pull, push, or edit `.gitignore`.
 
@@ -43,7 +47,7 @@ Attach a repository at launch:
 papre --repo /path/to/manuscript --main main.tex --allow-write --port 8765
 ```
 
-Omit `--allow-write` to disable manuscript Apply/Undo. With `--repo`, the directory browser defaults to that repository's parent. The example path is a placeholder; use an appropriate path for your operating system.
+Omit `--allow-write` to disable manuscript Apply/Undo. With `--repo`, folder selection starts at that repository. The example path is a placeholder; use an appropriate path for your operating system.
 
 For a demonstration:
 
@@ -51,9 +55,11 @@ For a demonstration:
 papre --demo
 ```
 
-This creates a Git repository containing synthetic scientific examples and queues three manuscript edits. Runtime files are stored in a user data directory, independently of the installed package:
+This creates a Git repository containing synthetic scientific examples and queues three manuscript edits.
 
 The [example patch](papre/demo/example.patch) targets the bundled [demo manuscript](papre/demo/main.tex). It clarifies three passages without changing its numerical values or equations. In the demo, the patch is already queued: review each change, or choose **Accept pending**, then **Apply accepted changes**. For another repository, generate a patch against that repository's current source instead.
+
+Runtime files are stored in a user data directory, independently of the installed package:
 
 | Operating system | Default state directory |
 | --- | --- |
@@ -151,13 +157,16 @@ Each search must match exactly once. Include surrounding text when needed for un
 - `papre/queue.py`: directory discovery, enqueue, skip, archive, version preservation, processing, and review receipts.
 - `papre/preview.py`: snapshots, asynchronous compilation, timeouts, logs, PDFs, and rendered pages.
 - `papre/server.py`: directory browser, repository attachment, loopback HTTP API, request protection, and launcher configuration.
+- `papre/picker.py`: native desktop folder dialogs with cancellation and an in-page fallback.
 - `papre/static/components.js`: shared custom controls and split/source viewers. `app.js` coordinates the workflow; `style.css` defines their appearance.
 
 This version changes existing UTF-8/LF `.tex`, `.bib`, `.sty`, `.cls`, and `.bst` files up to 2 MB. It excludes file creation/deletion, renames, permission changes, binary patches, hidden paths, symlinks, Git's quoted path syntax, and changes inside `review_queue`. Ordinary filenames containing spaces and existing dirty worktrees are supported. Queued patches are limited to 16 MB.
 
 Previews copy tracked and nonignored regular files, including images. Queue artifacts, ignored assets, external symlinks, and hidden files are omitted. Snapshots are limited to 64 MB per file and 256 MB total. Compilation stops after 120 seconds. Rendering stops after 45 seconds and displays up to 50 pages; the original PDF includes all pages. Builds and logs remain in review state; old `builds/` folders can be removed while the server is stopped.
 
-The compiler disables shell escape and automatic `latexmkrc` execution and restricts TeX input/output paths. It is intended for trusted local manuscripts and is not an operating-system sandbox. Packages such as `minted` or custom `.latexmkrc` rules require an extension to the compiler adapter. Local TeX versions and packages may render differently from Overleaf. A failed build does not expose a partial PDF as a successful preview.
+Compilation continues through recoverable LaTeX errors by default. If the engine produces a new PDF, the app displays it as **Preview with errors**, with a warning and the compilation log. Check **Stop on first error** to request the stricter compiler behavior. Error previews may omit content or have incorrect formatting. Missing required packages or fatal errors can prevent any PDF from being generated; these builds show the error and produce no new preview. Package and class lookup uses the selected TeX installation on PATH. `papre --check` prints the detected tool paths; use an up-to-date TeX distribution containing the manuscript's packages. A PDF stored in the manuscript repository is never reused as output from a failed build.
+
+The compiler disables shell escape and automatic `latexmkrc` execution and restricts TeX input/output paths. It is intended for trusted local manuscripts and is not an operating-system sandbox. Packages such as `minted` or custom `.latexmkrc` rules require an extension to the compiler adapter. Local TeX versions and packages may render differently from Overleaf. A preview produced despite errors is explicitly distinguished from a successful compilation; incomplete PDF files are not served.
 
 The server binds only to loopback and guards mutations with a request token and repository identity. Repository attachment affects the server's current session; use one browser session per server when switching repositories. Saved decisions use revisions to prevent competing edits from silently overwriting each other. If an Apply/Undo operation is interrupted, startup compares recovery snapshots with source and locks ambiguous results instead of overwriting files.
 
