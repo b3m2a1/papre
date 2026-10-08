@@ -94,6 +94,47 @@ def main():
                 assert (repo_path / "main.tex").read_text() == before
                 page.screenshot(path=str(qa / "review-desktop.png"), full_page=True)
 
+                # Shared dividers support dragging, keyboard resizing, and bounded widths.
+                def width(selector):
+                    return page.locator(selector).first.bounding_box()["width"]
+
+                def drag(selector, delta):
+                    box = page.locator(selector).bounding_box()
+                    x, y = box["x"] + box["width"] / 2, box["y"] + 160
+                    page.mouse.move(x, y)
+                    page.mouse.down()
+                    page.mouse.move(x + delta, y, steps=8)
+                    page.mouse.up()
+                    assert "resizing-panels" not in page.locator("body").get_attribute("class")
+
+                original_review_width = width(".review-pane")
+                page.get_by_role("button", name="Hide sidebar", exact=True).click()
+                expect(page.locator("#sidebar")).not_to_be_visible()
+                expect(page.locator("#sidebar-splitter")).not_to_be_visible()
+                assert width(".review-pane") > original_review_width + 200
+                page.get_by_role("button", name="Show sidebar", exact=True).click()
+                drag("#sidebar-splitter", 65)
+                assert abs(width("#sidebar") - 300) < 2
+                page.locator("#sidebar-splitter").press("ArrowRight")
+                assert abs(width("#sidebar") - 310) < 2
+                page.get_by_role("button", name="PDF preview", exact=True).click()
+                drag("#preview-splitter", -220)
+                assert abs(width("#preview-pane") - 600) < 2
+                page.locator("#preview-splitter").press("ArrowRight")
+                assert abs(width("#preview-pane") - 590) < 2
+                page.locator("#preview-splitter").press("End")
+                assert width(".review-pane") >= 359
+                page.set_viewport_size({"width": 1024, "height": 1100})
+                assert width(".review-pane") >= 359
+                assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+                page.set_viewport_size({"width": 1600, "height": 1100})
+                page.locator("#preview-splitter").press("Home")
+                drag("#preview-splitter", -400)
+                assert abs(width("#preview-pane") - 700) < 2
+                page.get_by_role("button", name="Hide sidebar", exact=True).click()
+                page.get_by_role("button", name="PDF preview", exact=True).click()
+                expect(page.locator("#preview-splitter")).not_to_be_visible()
+
                 # Context beyond the patch is expandable, and full source stays read-only.
                 page.locator("#context-size").select_option("3")
                 expect(page.locator(".context-gap").first).to_be_visible()
@@ -135,8 +176,12 @@ def main():
                 page.reload()
                 expect(page.locator("article.hunk.accepted")).to_have_count(2)
                 expect(page.locator("article.hunk.rejected")).to_have_count(1)
+                expect(page.locator("#sidebar")).not_to_be_visible()
+                page.get_by_role("button", name="Show sidebar", exact=True).click()
+                assert abs(width("#sidebar") - 310) < 2
                 assert (repo_path / "main.tex").read_text() == before
                 page.get_by_role("button", name="PDF preview", exact=True).click()
+                assert abs(width("#preview-pane") - 700) < 2
                 expect(page.locator("#compiler-status")).to_contain_text("pdflatex")
                 expect(page.locator("#latex-install")).to_have_attribute("href", server.session()["compiler"]["installation"]["url"])
                 page.locator("#preview-selection").select_option("accepted")
@@ -148,6 +193,38 @@ def main():
                 assert response.body().startswith(b"%PDF")
                 assert (repo_path / "main.tex").read_text() == before
                 page.screenshot(path=str(qa / "review-with-pdf.png"), full_page=True)
+
+                # Expanded viewing keeps review decisions, zoom, and the normal layout intact.
+                normal_pdf_width = width("#pdf-pages img")
+                page.get_by_role("button", name="Expand PDF", exact=True).click()
+                expect(page.locator("#sidebar")).not_to_be_visible()
+                expect(page.locator(".review-pane")).not_to_be_visible()
+                expect(page.locator("#preview-splitter")).not_to_be_visible()
+                assert abs(width("#preview-pane") - 1600) < 2
+                assert width("#pdf-pages img") > normal_pdf_width * 2
+                assert not page.locator("#preview-settings").evaluate("element => element.open")
+                page.screenshot(path=str(qa / "expanded-pdf.png"))
+                page.locator("#pdf-zoom").select_option("200")
+                page.locator("#preview-settings summary").click()
+                expect(page.get_by_role("button", name="Compile preview", exact=True)).to_be_visible()
+                page.keyboard.press("Escape")
+                expect(page.locator("#sidebar")).to_be_visible()
+                expect(page.locator(".review-pane")).to_be_visible()
+                assert abs(width("#preview-pane") - 700) < 2
+                expect(page.locator("#pdf-zoom")).to_have_value("200")
+                page.locator("#pdf-zoom").select_option("fit")
+                page.get_by_role("button", name="Expand PDF", exact=True).click()
+                page.get_by_role("button", name="Restore split view", exact=True).click()
+                expect(page.locator("article.hunk.accepted")).to_have_count(2)
+                expect(page.locator("article.hunk.rejected")).to_have_count(1)
+                page.get_by_role("button", name="Hide sidebar", exact=True).click()
+                page.get_by_role("button", name="Expand PDF", exact=True).click()
+                page.get_by_role("button", name="PDF preview", exact=True).click()
+                expect(page.locator("#preview-pane")).not_to_be_visible()
+                expect(page.locator(".review-pane")).to_be_visible()
+                expect(page.locator("#sidebar")).not_to_be_visible()
+                page.get_by_role("button", name="Show sidebar", exact=True).click()
+                page.get_by_role("button", name="PDF preview", exact=True).click()
                 with page.expect_download() as download_info:
                     page.locator("#export-patch").click()
                 download_info.value.save_as(str(qa / "accepted.patch"))
@@ -229,7 +306,7 @@ def main():
                 assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "Mobile viewport overflows"
                 assert not errors, errors
                 browser.close()
-            print("Browser workflow passed: directory selection, queue import, split diff, full context, edit/reject, backups, persistence, PDF, apply/undo, skip/archive, external discovery, mobile.")
+            print("Browser workflow passed: directory selection, queue import, split diff, full context, edit/reject, backups, persistence, PDF, panel resizing, sidebar toggle, expanded PDF, apply/undo, skip/archive, external discovery, mobile.")
             print(f"Screenshots: {qa}")
         finally:
             server.shutdown()

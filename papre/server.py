@@ -230,6 +230,7 @@ class Handler(BaseHTTPRequestHandler):
             static_files = {"/": ("index.html", "text/html; charset=utf-8"),
                             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
                             "/components.js": ("components.js", "text/javascript; charset=utf-8"),
+                            "/layout.js": ("layout.js", "text/javascript; charset=utf-8"),
                             "/style.css": ("style.css", "text/css; charset=utf-8")}
             if path in static_files:
                 filename, content_type = static_files[path]

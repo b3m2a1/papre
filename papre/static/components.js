@@ -13,7 +13,7 @@ export function button(label, onClick, variant = 'default') {
   return element;
 }
 class UIButton extends HTMLElement {
-  static observedAttributes = ['label', 'disabled', 'variant', 'pressed', 'detail'];
+  static observedAttributes = ['label', 'disabled', 'variant', 'pressed', 'detail', 'expanded', 'controls'];
   connectedCallback() { this.render(); }
   attributeChangedCallback() { if (this.isConnected) this.render(); }
   get disabled() { return this.hasAttribute('disabled'); }
@@ -31,6 +31,50 @@ class UIButton extends HTMLElement {
     if (detail) this.control.append(node('small', 'button-detail', detail));
     if (this.hasAttribute('pressed')) this.control.setAttribute('aria-pressed', this.getAttribute('pressed'));
     else this.control.removeAttribute('aria-pressed');
+    for (const name of ['expanded', 'controls']) {
+      if (this.hasAttribute(name)) this.control.setAttribute('aria-' + name, this.getAttribute(name));
+      else this.control.removeAttribute('aria-' + name);
+    }
+  }
+}
+class UISplitter extends HTMLElement {
+  connectedCallback() {
+    if (this.mounted) return;
+    this.mounted = true; this.tabIndex = 0;
+    this.setAttribute('role', 'separator'); this.setAttribute('aria-orientation', 'vertical');
+    this.setAttribute('aria-label', this.getAttribute('label') || 'Resize panels');
+    this.title = 'Drag to resize, or use the Left and Right arrow keys';
+    this.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+      event.preventDefault(); this.focus(); this.setPointerCapture(event.pointerId);
+      this.pointer = event.pointerId; this.lastX = event.clientX;
+      this.classList.add('dragging'); this.emit('start');
+    });
+    this.addEventListener('pointermove', event => {
+      if (event.pointerId !== this.pointer) return;
+      const delta = event.clientX - this.lastX; this.lastX = event.clientX;
+      this.emit('resize', {delta});
+    });
+    const finish = () => {
+      if (this.pointer === undefined) return;
+      this.pointer = undefined; this.classList.remove('dragging'); this.emit('end');
+    };
+    for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) this.addEventListener(event, finish);
+    this.addEventListener('keydown', event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      this.emit('resize', {delta: (event.key === 'ArrowLeft' ? -1 : 1) * (event.shiftKey ? 40 : 10),
+        edge: event.key === 'Home' ? 'min' : event.key === 'End' ? 'max' : null});
+      this.emit('end');
+    });
+  }
+  emit(phase, extra = {}) {
+    this.dispatchEvent(new CustomEvent('splitter-change', {bubbles: true, detail: {phase, ...extra}}));
+  }
+  set range({min, max, value}) {
+    this.value = value;
+    this.setAttribute('aria-valuemin', Math.round(min)); this.setAttribute('aria-valuemax', Math.round(max));
+    this.setAttribute('aria-valuenow', Math.round(value)); this.setAttribute('aria-valuetext', `${Math.round(value)} pixels`);
   }
 }
 class UIField extends HTMLElement {
@@ -56,6 +100,7 @@ class UIDialog extends HTMLElement {
 customElements.define('ui-button', UIButton);
 customElements.define('ui-field', UIField);
 customElements.define('ui-dialog', UIDialog);
+customElements.define('ui-splitter', UISplitter);
 export function splitLines(text) {
   if (!text) return [];
   const lines = text.split('\n'); if (lines.at(-1) === '') lines.pop(); return lines;

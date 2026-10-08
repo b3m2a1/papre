@@ -1,4 +1,5 @@
 import {$, $$, node, button} from './components.js';
+import './layout.js';
 let session, entry = null, proposal = null, sourcePath = null, busy = false, lastBuild = null, directory = null;
 let importFilename = null, warningEntry = null, toastTimer, polling = false, opening = 0, buildGeneration = 0, queueGeneration = 0;
 const drafts = new Map(), editing = new Set(), expanded = new Set();
@@ -312,9 +313,6 @@ $('#refresh').addEventListener('click', async () => {
   if (!safeNavigate()) return;
   try { await refreshSession(); if (entry) await openEntry(entry.id); else await nextEntry(null); }
   catch (error) { toast(error.message, true); }
-});
-$('#toggle-preview').addEventListener('click', () => {
-  $('#preview-pane').hidden = !$('#preview-pane').hidden; $('#toggle-preview').setAttribute('pressed', String(!$('#preview-pane').hidden));
 });
 function previewHint() {
   if (!session) return;
