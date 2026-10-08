@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "papre"
+version = "0.3.0"
+description = "Paper Patch Review Editor: review and edit LaTeX patches before applying them"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+keywords = ["latex", "scientific-writing", "patch-review", "git"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Text Processing :: Markup :: LaTeX",
+]
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "playwright>=1.40"]
+
+[project.scripts]
+papre = "papre.server:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["papre*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+papre = ["static/*.html", "static/*.css", "static/*.js", "demo/*.tex", "demo/*.bib", "demo/*.patch", "demo/.gitignore"]

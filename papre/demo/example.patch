@@ -1,0 +1,32 @@
+--- a/main.tex
++++ b/main.tex
+@@ -14,7 +14,8 @@
+ \begin{abstract}
+ Mechanical force can alter the rates of chemical reactions.
+ In this study, we investigate how a model reaction responds to force.
+-We find that the reaction gets faster when more force is applied.
++For a positive transition distance, the model predicts an increase in the
++reaction rate with applied force.
+ The results are consistent with a force-dependent activation barrier.
+ \end{abstract}
+ 
+@@ -45,7 +46,8 @@
+ \section{Results and discussion}
+ Equation~\ref{eq:barrier} predicts a lower activation barrier as the applied
+ force increases for a positive transition distance.
+-This is due to the fact that the force makes the barrier lower.
++The force stabilizes the transition state relative to the initial state
++through the coupling term $-F\Delta x^{\ddagger}$.
+ The corresponding rate depends exponentially on the activation free energy:
+ \begin{equation}
+   k(F) = k(0)\exp\!\left(\frac{F\Delta x^{\ddagger}}{k_{\mathrm{B}}T}\right).
+@@ -56,7 +58,8 @@
+ underlying free-energy surface would require a more detailed model.
+ 
+ \section{Conclusion}
+-We have shown that force controls the reaction mechanism.
++Within this model, force modulates the activation barrier and the
++predicted reaction rate; a change in mechanism is not established.
+ Future work will compare the simple model with a more complete
+ description of the free-energy surface.
+ 

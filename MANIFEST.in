@@ -1,0 +1,10 @@
+include README.md AGENTS.md pyproject.toml run-local.sh
+recursive-include papre/static *.html *.css *.js
+recursive-include papre/demo *.tex *.bib *.patch
+include papre/demo/.gitignore
+recursive-include tests *.py
+prune .runtime
+prune .git
+prune .venv
+prune build
+global-exclude __pycache__ *.py[cod] .DS_Store

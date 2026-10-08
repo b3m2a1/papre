@@ -1,0 +1,65 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{natbib}
+\usepackage{hyperref}
+
+\title{Force-dependent reaction pathways\\in a model system}
+\author{Demo Manuscript}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Mechanical force can alter the rates of chemical reactions.
+In this study, we investigate how a model reaction responds to force.
+We find that the reaction gets faster when more force is applied.
+The results are consistent with a force-dependent activation barrier.
+\end{abstract}
+
+\section{Introduction}
+The relationship between molecular structure and mechanical response
+motivates the study of force-dependent reactivity. A simple model
+provides a useful starting point for comparing reaction pathways.
+This document contains synthetic examples for testing a writing interface;
+the values and conclusions below are not experimental findings.
+Further details are provided in the demonstration notes~\citep{demo}.
+
+\section{Model and methods}
+We consider a one-dimensional reaction coordinate and represent the
+effect of an applied force using a linear coupling term. The
+force-dependent activation free energy is written as
+\begin{equation}
+  \Delta G^{\ddagger}(F) = \Delta G^{\ddagger}(0) - F\Delta x^{\ddagger},
+  \label{eq:barrier}
+\end{equation}
+where $F$ is the applied force and $\Delta x^{\ddagger}$ is the distance
+between the initial state and the transition state along the force axis.
+
+The model uses an illustrative temperature of $T = 298\,\mathrm{K}$ and
+an illustrative transition distance of $\Delta x^{\ddagger} = 0.12\,\mathrm{nm}$.
+We examine forces from $0$ to $200\,\mathrm{pN}$ in increments of
+$25\,\mathrm{pN}$. These values are used only to exercise the preview.
+
+\section{Results and discussion}
+Equation~\ref{eq:barrier} predicts a lower activation barrier as the applied
+force increases for a positive transition distance.
+This is due to the fact that the force makes the barrier lower.
+The corresponding rate depends exponentially on the activation free energy:
+\begin{equation}
+  k(F) = k(0)\exp\!\left(\frac{F\Delta x^{\ddagger}}{k_{\mathrm{B}}T}\right).
+  \label{eq:rate}
+\end{equation}
+This expression assumes that the transition distance remains constant
+over the force range of interest. Changes in mechanism or in the
+underlying free-energy surface would require a more detailed model.
+
+\section{Conclusion}
+We have shown that force controls the reaction mechanism.
+Future work will compare the simple model with a more complete
+description of the free-energy surface.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+\end{document}
