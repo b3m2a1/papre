@@ -1,5 +1,6 @@
 """Real-browser verification of the review queue using disposable draft files."""
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -41,13 +42,29 @@ def main():
         thread.start()
         try:
             with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
+                # Full Chromium includes its PDF viewer; the headless shell does not.
+                browser = playwright.chromium.launch(headless=True, channel="chromium")
                 context = browser.new_context(viewport={"width": 1600, "height": 1100})
                 page = context.new_page()
                 errors = []
+                preview_jobs = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
+                def record_preview(response):
+                    if response.url.endswith("/api/previews") and response.request.method == "POST" and response.status == 202:
+                        preview_jobs.append(response.json())
+                page.on("response", record_preview)
                 page.goto(f"http://127.0.0.1:{server.server_port}")
                 expect(page).to_have_title("Paper Patch Review Editor")
+                logo = page.get_by_role("img", name="Paper Patch Review Editor", exact=True)
+                expect(logo).to_be_visible()
+                logo.evaluate("image => image.decode()")
+                assert logo.evaluate("image => image.naturalWidth") == 256
+                assert logo.bounding_box()["width"] == 28
+                for filename, mime in [("favicon.svg", "image/svg+xml"), ("favicon.ico", "image/vnd.microsoft.icon")]:
+                    icon = page.locator(f'link[rel="icon"][href="/assets/{filename}"]')
+                    assert icon.count() == 1
+                    response = context.request.get(f"http://127.0.0.1:{server.server_port}/assets/{filename}")
+                    assert response.ok and response.headers["content-type"] == mime
                 expect(page.locator("#repo-dialog dialog")).to_be_visible()
                 page.screenshot(path=str(qa / "directory-picker.png"))
                 with patch("papre.server.pick_directory", return_value=None):
@@ -88,10 +105,72 @@ def main():
                     page.get_by_role("button", name="Add to queue", exact=True).click()
                     expect(page.locator("#import-dialog dialog")).not_to_be_visible()
 
+                def open_settings():
+                    if not page.locator("#preview-settings").is_visible():
+                        page.get_by_role("button", name="Compilation settings", exact=True).click()
+                    expect(page.locator("#preview-settings")).to_be_visible()
+                    expect(page.locator("#toggle-preview-settings button")).to_have_attribute("aria-expanded", "true")
+
+                def show_preview():
+                    if not page.locator("#preview-pane").is_visible():
+                        page.get_by_role("button", name="PDF preview", exact=True).click()
+                    expect(page.locator("#preview-pane")).to_be_visible()
+
+                def compile_preview():
+                    open_settings()
+                    page.get_by_role("button", name="Compile preview", exact=True).click()
+                    expect(page.locator("#preview-settings")).not_to_be_visible()
+
+                def check_pdf_bounds():
+                    frame = page.locator("#pdf-frame").bounding_box()
+                    content = page.locator(".preview-content").bounding_box()
+                    for key in ["x", "y", "width", "height"]:
+                        assert abs(frame[key] - content[key]) < 1, (frame, content)
+                    assert page.locator("#pdf-frame").evaluate("element => getComputedStyle(element).padding") == "0px"
+                    pane = page.locator("#preview-pane").bounding_box()
+                    for selector in ["#main-file", "#open-pdf", "#expand-preview", "#toggle-preview-settings"]:
+                        box = page.locator(selector).bounding_box()
+                        assert pane["x"] <= box["x"] and box["x"] + box["width"] <= pane["x"] + pane["width"] + 1, (selector, box, pane)
+                    return frame
+
                 import_patch("Example manuscript edits", original_patch)
                 expect(page.locator("article.hunk")).to_have_count(3)
+                expect(page.locator("#build-badge")).to_contain_text("Ready", timeout=45000)
+                expect(page.locator("#preview-pane")).to_be_visible()
+                expect(page.locator("#pdf-frame")).to_be_visible()
+                expect(page.locator("#preview-settings")).not_to_be_visible()
+                assert page.locator("#pdf-frame").get_attribute("src").split('/')[-2] == server.previews.latest
+                expect(page.locator("#expand-preview button")).to_have_attribute("title", "Expand PDF")
+                expect(page.locator("#expand-preview svg")).to_be_visible()
+                assert page.locator("#expand-preview").bounding_box()["width"] < 45
+                assert preview_jobs, "Opening the patch should start a background build"
+                assert preview_jobs[-1]["selection"] == "proposed"
                 assert (queue / "Example-manuscript-edits.patch").read_text() == original_patch
                 assert (repo_path / "main.tex").read_text() == before
+                expect(page.locator('.hunk .change-location').first).to_contain_text('PDF p. 1')
+                job = server.previews.get(server.previews.latest)
+                assert all(change['highlighted'] for change in job['changes'])
+                assert [change['page'] for change in job['changes']] == [1, 1, 2]
+                page.locator('.hunk').first.get_by_role('button', name='Scroll to Section', exact=True).click()
+                expect(page.locator('#pdf-frame')).to_have_attribute('src', job['pdf'] + '#page=1')
+                expect(page.locator('#pdf-location')).to_contain_text('source ¶')
+                # The native viewer remains default; the image alternative supports reverse navigation.
+                open_settings()
+                page.locator('#pdf-viewer').select_option('pages')
+                page.get_by_role('button', name='Compilation settings', exact=True).click()
+                change = job['changes'][-1]
+                page.locator('.hunk').last.get_by_role('button', name='Scroll to Section', exact=True).click()
+                image = page.locator(f'#pdf-pages img[data-page="{change["page"]}"]')
+                image.evaluate('image => image.decode()')
+                factor = image.bounding_box()['width'] / image.evaluate('image => image.naturalWidth') * 120 / 72
+                image.dblclick(position={'x': (change['x'] + 2) * factor, 'y': (change['y'] - 2) * factor})
+                expect(page.locator(f'article[data-hunk="{change["id"]}"]')).to_have_class(re.compile('pdf-linked'))
+                assert page.evaluate('location.hash') == '#change-' + change['id']
+                page.screenshot(path=str(qa / 'green-proposed-edits.png'), full_page=True)
+                open_settings()
+                page.locator('#pdf-viewer').select_option('browser')
+                page.get_by_role('button', name='Compilation settings', exact=True).click()
+                page.evaluate("history.replaceState(null, '', '/')")
                 page.screenshot(path=str(qa / "review-desktop.png"), full_page=True)
 
                 # Shared dividers support dragging, keyboard resizing, and bounded widths.
@@ -117,7 +196,9 @@ def main():
                 assert abs(width("#sidebar") - 300) < 2
                 page.locator("#sidebar-splitter").press("ArrowRight")
                 assert abs(width("#sidebar") - 310) < 2
-                page.get_by_role("button", name="PDF preview", exact=True).click()
+                show_preview()
+                expect(page.locator("#preview-settings")).not_to_be_visible()
+                expect(page.locator("#toggle-preview-settings button")).to_have_attribute("aria-expanded", "false")
                 drag("#preview-splitter", -220)
                 assert abs(width("#preview-pane") - 600) < 2
                 page.locator("#preview-splitter").press("ArrowRight")
@@ -171,6 +252,14 @@ def main():
                 assert final_path.with_name(final_path.name + ".review.json").is_file()
                 assert "higher" not in final_path.read_text()
                 assert "coupling term" in final_path.read_text()
+                expect(page.locator("#build-badge")).to_contain_text("Ready", timeout=45000)
+                expect(page.locator("#preview-pane")).not_to_be_visible()
+                assert page.locator("#pdf-frame").get_attribute("src").split('/')[-2] == server.previews.latest
+                latest = server.previews.get(server.previews.latest)
+                assert latest["revision"] == server.store.get(latest["proposal"])["revision"]
+                assert "higher" not in (server.previews.root / latest["id"] / "source/main.tex").read_text()
+                assert (server.previews.root / latest["id"] / "source/main.tex").read_text() != before
+                assert any(job["status"] == "cancelled" for job in server.previews.jobs.values())
 
                 # Persistence and compilation from an isolated accepted-changes snapshot.
                 page.reload()
@@ -180,13 +269,68 @@ def main():
                 page.get_by_role("button", name="Show sidebar", exact=True).click()
                 assert abs(width("#sidebar") - 310) < 2
                 assert (repo_path / "main.tex").read_text() == before
-                page.get_by_role("button", name="PDF preview", exact=True).click()
+                show_preview()
                 assert abs(width("#preview-pane") - 700) < 2
                 expect(page.locator("#compiler-status")).to_contain_text("pdflatex")
                 expect(page.locator("#latex-install")).to_have_attribute("href", server.session()["compiler"]["installation"]["url"])
+                open_settings()
                 page.locator("#preview-selection").select_option("accepted")
-                page.get_by_role("button", name="Compile preview", exact=True).click()
                 expect(page.locator("#build-badge")).to_contain_text("Ready", timeout=45000)
+                assert page.locator("#pdf-frame").get_attribute("src").split('/')[-2] == server.previews.latest
+                warmed_id = server.previews.latest
+                compile_preview()
+                expect(page.locator("#build-badge")).to_contain_text("Ready", timeout=45000)
+                assert server.previews.latest == warmed_id, "Compile preview must reuse the prepared PDF"
+                expect(page.locator("#pdf-frame")).to_be_visible()
+                expect(page.locator("#pdf-frame")).to_have_attribute("src", page.locator("#open-pdf").get_attribute("href"))
+                expect(page.locator("#pdf-pages")).not_to_be_visible()
+                expect(page.locator(".preview-toolbar #main-file")).to_have_value("main.tex")
+                expect(page.locator(".preview-toolbar #pdf-viewer")).to_have_count(0)
+                expect(page.locator("#preview-settings #pdf-viewer")).to_have_value("browser")
+                expect(page.locator(".preview-toolbar #open-pdf")).to_be_visible()
+                check_pdf_bounds()
+                if not any(frame.url.startswith("chrome-extension://") for frame in page.frames):
+                    page.wait_for_event("framenavigated", predicate=lambda frame: frame.url.startswith("chrome-extension://"), timeout=15000)
+                pdf_viewer = page.frame(url=re.compile(r"^chrome-extension://"))
+                expect(pdf_viewer.get_by_role("textbox", name="Page number", exact=True)).to_have_value("1", timeout=15000)
+                expect(pdf_viewer.get_by_role("button", name="Zoom in", exact=True)).to_be_visible()
+                page.screenshot(path=str(qa / "browser-pdf.png"))
+                page.get_by_role("button", name="Expand PDF", exact=True).click()
+                expect(page.locator("#expand-preview button")).to_have_attribute("title", "Restore split view")
+                expect(page.locator("#expand-preview svg")).to_be_visible()
+                assert width("#expand-preview") < 45
+                pdf_viewer.wait_for_function("() => window.innerWidth > 1400", timeout=15000)
+                frame_bounds = check_pdf_bounds()
+                assert frame_bounds["height"] > page.locator("#preview-pane").bounding_box()["height"] * .9
+                page.screenshot(path=str(qa / "browser-pdf-expanded.png"))
+                open_settings()
+                assert check_pdf_bounds() == frame_bounds, "Settings must overlay, without shrinking the PDF"
+                expect(page.locator("#preview-settings #toggle-log")).to_be_visible()
+                page.get_by_role("button", name="Show log", exact=True).click()
+                expect(page.locator("#preview-settings #build-log")).to_be_visible()
+                page.screenshot(path=str(qa / "pdf-settings-overlay.png"))
+                page.keyboard.press("Escape")
+                expect(page.locator("#preview-settings")).not_to_be_visible()
+                expect(page.locator("#toggle-preview-settings button")).to_be_focused()
+                expect(page.locator(".review-pane")).not_to_be_visible()
+                open_settings()
+                # Wait for the native PDF's composited hit regions to update, too.
+                page.locator(".drawer-backdrop button").click(position={"x": 20, "y": 30})
+                expect(page.locator("#preview-settings")).not_to_be_visible()
+                open_settings()
+                page.locator("#preview-settings").get_by_role("button", name="Close", exact=True).click()
+                expect(page.locator("#toggle-preview-settings button")).to_be_focused()
+                page.get_by_role("button", name="Compilation settings", exact=True).press("Space")
+                expect(page.locator("#preview-settings")).to_be_visible()
+                page.get_by_role("button", name="Compilation settings", exact=True).click()
+                expect(page.locator("#preview-settings")).not_to_be_visible()
+                page.get_by_role("button", name="Restore split view", exact=True).click()
+                expect(page.locator("#expand-preview button")).to_have_attribute("title", "Expand PDF")
+                viewer_build = server.previews.latest
+                open_settings()
+                page.locator("#pdf-viewer").select_option("pages")
+                page.get_by_role("button", name="Compilation settings", exact=True).click()
+                assert server.previews.latest == viewer_build, "Switching viewers must not recompile"
                 expect(page.locator("#pdf-pages img").first).to_be_visible()
                 page.wait_for_function("document.querySelector('#pdf-pages img')?.naturalWidth > 0")
                 response = context.request.get(f"http://127.0.0.1:{server.server_port}" + page.locator("#open-pdf").get_attribute("href"))
@@ -204,14 +348,18 @@ def main():
                 assert width("#pdf-pages img") > normal_pdf_width * 2
                 assert not page.locator("#preview-settings").evaluate("element => element.open")
                 page.screenshot(path=str(qa / "expanded-pdf.png"))
+                open_settings()
                 page.locator("#pdf-zoom").select_option("200")
-                page.locator("#preview-settings summary").click()
                 expect(page.get_by_role("button", name="Compile preview", exact=True)).to_be_visible()
+                page.keyboard.press("Escape")
+                expect(page.locator("#preview-settings")).not_to_be_visible()
+                expect(page.locator(".review-pane")).not_to_be_visible()
                 page.keyboard.press("Escape")
                 expect(page.locator("#sidebar")).to_be_visible()
                 expect(page.locator(".review-pane")).to_be_visible()
                 assert abs(width("#preview-pane") - 700) < 2
                 expect(page.locator("#pdf-zoom")).to_have_value("200")
+                open_settings()
                 page.locator("#pdf-zoom").select_option("fit")
                 page.get_by_role("button", name="Expand PDF", exact=True).click()
                 page.get_by_role("button", name="Restore split view", exact=True).click()
@@ -240,29 +388,33 @@ def main():
                 assert (repo_path / "main.tex").read_text() == before
 
                 # Recoverable errors display a fresh PDF, while missing packages cannot.
+                open_settings()
                 page.locator("#preview-selection").select_option("working")
                 page.locator("#main-file").select_option("error-preview.tex")
                 expect(page.locator("#compile-strict")).not_to_be_checked()
-                page.get_by_role("button", name="Compile preview", exact=True).click()
+                compile_preview()
                 expect(page.locator("#build-badge")).to_have_text("Preview with errors", timeout=45000)
                 expect(page.locator("#build-warning")).to_contain_text("preview may be incomplete")
-                expect(page.locator("#build-log")).to_be_visible()
+                expect(page.locator("#preview-settings")).not_to_be_visible()
                 expect(page.locator("#pdf-pages img").first).to_be_visible()
                 response = context.request.get(f"http://127.0.0.1:{server.server_port}" + page.locator("#open-pdf").get_attribute("href"))
                 assert response.body().startswith(b"%PDF")
                 page.screenshot(path=str(qa / "preview-with-errors.png"), full_page=True)
+                open_settings()
+                expect(page.locator("#build-log")).to_be_visible()
                 page.locator("#compile-strict").check()
-                page.get_by_role("button", name="Compile preview", exact=True).click()
+                compile_preview()
                 expect(page.locator("#build-badge")).to_have_text("Build failed", timeout=45000)
                 expect(page.locator("#open-pdf")).not_to_be_visible()
+                open_settings()
                 page.locator("#compile-strict").uncheck()
                 page.locator("#main-file").select_option("missing-package.tex")
-                page.get_by_role("button", name="Compile preview", exact=True).click()
+                compile_preview()
                 expect(page.locator("#build-badge")).to_have_text("Build failed", timeout=45000)
                 expect(page.locator("#build-warning")).to_contain_text("papre-missing-package.sty")
                 expect(page.locator("#open-pdf")).not_to_be_visible()
                 page.locator("#main-file").select_option("main.tex")
-                page.get_by_role("button", name="Compile preview", exact=True).click()
+                compile_preview()
                 expect(page.locator("#build-badge")).to_contain_text("Ready", timeout=45000)
                 expect(page.locator("#build-warning")).not_to_be_visible()
 
@@ -300,13 +452,25 @@ def main():
                 page.get_by_role("button", name="Git status and history", exact=True).click()
                 expect(page.locator("#git-status")).to_contain_text("review_queue/")
                 page.locator("#git-dialog").get_by_role("button", name="Close", exact=True).click()
-                page.get_by_role("button", name="PDF preview", exact=True).click()
                 page.set_viewport_size({"width": 390, "height": 844})
+                open_settings()
+                page.locator("#pdf-viewer").select_option("browser")
+                page.get_by_role("button", name="Expand PDF", exact=True).click()
+                expect(page.locator("#preview-settings")).not_to_be_visible()
+                check_pdf_bounds()
+                page.screenshot(path=str(qa / "pdf-toolbar-mobile.png"))
+                open_settings()
+                assert width(".ui-drawer-panel") <= 390
+                page.wait_for_function("() => document.querySelector('.ui-drawer-panel').getBoundingClientRect().right <= window.innerWidth + 1")
+                assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+                page.screenshot(path=str(qa / "pdf-settings-mobile.png"))
+                page.keyboard.press("Escape")
+                page.get_by_role("button", name="PDF preview", exact=True).click()
                 page.screenshot(path=str(qa / "review-mobile.png"), full_page=True)
                 assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "Mobile viewport overflows"
                 assert not errors, errors
                 browser.close()
-            print("Browser workflow passed: directory selection, queue import, split diff, full context, edit/reject, backups, persistence, PDF, panel resizing, sidebar toggle, expanded PDF, apply/undo, skip/archive, external discovery, mobile.")
+            print("Browser workflow passed: directory selection, queue import, split diff, full context, edit/reject, backups, persistence, PDF, panel resizing, sidebar toggle, expanded PDF, compact toolbar, settings overlay and dismissal, edge-to-edge iframe, apply/undo, skip/archive, external discovery, mobile.")
             print(f"Screenshots: {qa}")
         finally:
             server.shutdown()

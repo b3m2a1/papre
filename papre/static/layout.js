@@ -14,7 +14,7 @@ try {
 
 const layout = $('.app-layout'), sidebar = $('#sidebar'), preview = $('#preview-pane');
 const sidebarSplitter = $('#sidebar-splitter'), previewSplitter = $('#preview-splitter');
-let expanded = false, settingsBeforeExpand = true, scrollBeforeExpand = 0;
+let expanded = false, scrollBeforeExpand = 0, previewVisibilityChosen = false;
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 function save() {
   try { localStorage.setItem(preferenceKey, JSON.stringify(preferences)); } catch { /* Optional persistence. */ }
@@ -39,6 +39,7 @@ function render() {
   $('#toggle-sidebar').label = sidebar.hidden ? 'Show sidebar' : 'Hide sidebar';
   $('#toggle-sidebar').setAttribute('expanded', String(!sidebar.hidden));
   $('#expand-preview').label = expanded ? 'Restore split view' : 'Expand PDF';
+  $('#expand-preview').setAttribute('icon', expanded ? 'restore' : 'expand');
   $('#expand-preview').setAttribute('pressed', String(expanded));
   $('#toggle-preview').setAttribute('pressed', String(!preview.hidden));
   sidebarSplitter.range = {min: 160, max: sidebarMax, value: sidebarWidth};
@@ -46,10 +47,10 @@ function render() {
 }
 function setExpanded(value) {
   if (value === expanded) return;
+  $('#preview-settings').close(false);
   if (value) {
-    settingsBeforeExpand = $('#preview-settings').open; scrollBeforeExpand = window.scrollY;
-    $('#preview-settings').open = false; preview.hidden = false;
-  } else $('#preview-settings').open = settingsBeforeExpand;
+    scrollBeforeExpand = window.scrollY; preview.hidden = false;
+  }
   expanded = value; render();
   window.scrollTo(0, expanded ? 0 : scrollBeforeExpand);
 }
@@ -59,10 +60,25 @@ $('#toggle-sidebar').addEventListener('click', () => {
   render(); save();
 });
 $('#toggle-preview').addEventListener('click', () => {
+  previewVisibilityChosen = true;
   if (expanded) setExpanded(false);
+  $('#preview-settings').close(false);
   preview.hidden = !preview.hidden; render();
 });
+export function revealPreview() {
+  if (previewVisibilityChosen || !preview.hidden) return;
+  preview.hidden = false; render();
+}
 $('#expand-preview').addEventListener('click', () => setExpanded(!expanded));
+$('#toggle-preview-settings').addEventListener('click', () => {
+  const settings = $('#preview-settings');
+  if (settings.open) settings.close();
+  else settings.show($('#toggle-preview-settings').control);
+});
+$('#preview-settings').addEventListener('drawer-toggle', event => {
+  $('#toggle-preview-settings').setAttribute('expanded', String(event.detail.open));
+  $('.preview-content').classList.toggle('settings-open', event.detail.open);
+});
 for (const [splitter, key, direction] of [[sidebarSplitter, 'sidebarWidth', 1], [previewSplitter, 'previewWidth', -1]]) {
   splitter.addEventListener('splitter-change', event => {
     const {phase, delta, edge} = event.detail;
@@ -78,7 +94,7 @@ for (const [splitter, key, direction] of [[sidebarSplitter, 'sidebarWidth', 1], 
 }
 window.addEventListener('resize', render);
 document.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && expanded && !$('dialog[open]')) {
+  if (event.key === 'Escape' && !event.defaultPrevented && expanded && !$('dialog[open]')) {
     setExpanded(false); $('#expand-preview').control.focus();
   }
 });

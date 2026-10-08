@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" role="img" aria-labelledby="papre-favicon-title papre-favicon-desc">
+  <title id="papre-favicon-title">Paper Patch Review Editor</title>
+  <desc id="papre-favicon-desc">Small-size logo: an offset pen nib, a gray toolbar, and red and green review panels with gray text lines.</desc>
+  <defs>
+    <clipPath id="papre-favicon-frame">
+      <rect x="2" y="6" width="28" height="24" rx="3"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#papre-favicon-frame)">
+    <rect x="2" y="6" width="28" height="24" fill="#e9edf0"/>
+    <rect x="2" y="10" width="14" height="20" fill="#fde2e1"/>
+    <rect x="16" y="10" width="14" height="20" fill="#dff4e6"/>
+  </g>
+  <g fill="#a4aeb7">
+    <rect x="4" y="7" width="5" height="2" rx=".5"/>
+    <circle cx="12" cy="8" r=".75"/>
+  </g>
+  <g fill="#808b94">
+    <rect x="4" y="14" width="9" height="2"/>
+    <rect x="4" y="18" width="7" height="2"/>
+    <rect x="4" y="22" width="9" height="2"/>
+    <rect x="4" y="26" width="6" height="2"/>
+    <rect x="18" y="14" width="10" height="2"/>
+    <rect x="18" y="18" width="7" height="2"/>
+    <rect x="18" y="22" width="10" height="2"/>
+    <rect x="18" y="26" width="8" height="2"/>
+  </g>
+  <rect x="2" y="6" width="28" height="24" rx="3" fill="none" stroke="#4b5660" stroke-width="1"/>
+  <g transform="translate(26 1.5) rotate(20)">
+    <path d="M0 0L4.4 12L0 19L-4.4 12Z" fill="#26313b" stroke="#ffffff" stroke-width="1" stroke-linejoin="round"/>
+    <path d="M0 1.4V9.9" fill="none" stroke="#ffffff" stroke-width=".75" stroke-linecap="round"/>
+    <circle cy="11.5" r="1" fill="#ffffff"/>
+  </g>
+</svg>

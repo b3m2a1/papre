@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from papre.core import Repository, ReviewError, ReviewStore, git_patch, run_git
 from papre.preview import PreviewManager
-from papre.server import ROOT, ReviewHTTPServer
+from papre.server import ASSETS, ROOT, ReviewHTTPServer
 
 
 class ServerTests(unittest.TestCase):
@@ -60,6 +60,34 @@ class ServerTests(unittest.TestCase):
             time.sleep(.1)
         self.fail("Preview did not finish within 35 seconds")
 
+    def test_logo_assets_are_served_without_an_attached_repository(self):
+        server = ReviewHTTPServer(("127.0.0.1", 0), browse_start=self.root, state_base=self.root / "asset-state")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}"
+        expected = {"papre-logo.svg": "image/svg+xml", "favicon.svg": "image/svg+xml",
+                    "favicon.ico": "image/vnd.microsoft.icon",
+                    **{f"favicon-{size}.png": "image/png" for size in (16, 32, 48, 64)}}
+        try:
+            for filename, content_type in expected.items():
+                with self.subTest(filename=filename), urlopen(url + "/assets/" + filename, timeout=10) as response:
+                    self.assertEqual(response.headers.get_content_type(), content_type)
+                    self.assertEqual(response.read(), (ASSETS / filename).read_bytes())
+            with urlopen(url + "/favicon.ico", timeout=10) as response:
+                self.assertEqual(response.read(), (ASSETS / "favicon.ico").read_bytes())
+            for path in ("/assets/../server.py", "/assets/%2e%2e/server.py", "/assets/unknown.svg"):
+                with self.subTest(path=path), self.assertRaises(HTTPError) as caught:
+                    urlopen(url + path, timeout=10)
+                self.assertEqual(caught.exception.code, 404)
+            request = Request(url + "/assets/papre-logo.svg", headers={"Sec-Fetch-Site": "cross-site"})
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(request, timeout=10)
+            self.assertEqual(caught.exception.code, 403)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_host_token_and_origin_protection(self):
         for headers, token in [({}, "bad-token"), ({"Origin": "https://other.example"}, self.token),
                                ({"Host": "other.example"}, self.token)]:
@@ -103,6 +131,18 @@ class ServerTests(unittest.TestCase):
             with urlopen(self.url + job["pages"][0]) as response:
                 self.assertEqual(response.headers["Content-Type"], "image/png")
                 self.assertTrue(response.read().startswith(b"\x89PNG"))
+            if PreviewManager.available().get("synctex"):
+                import struct
+                change = job["changes"][0]
+                header = self.server.previews.page(job["id"], "1").read_bytes()[:24]
+                width, height = struct.unpack(">II", header[16:24])
+                point = {"page": 1, "x": (change["x"] + 2) * 120 / 72 / width,
+                         "y": (change["y"] - 2) * 120 / 72 / height}
+                result = self.post(f"/api/previews/{job['id']}/source", point)
+                self.assertEqual(result["hunk"], change["id"])
+                with self.assertRaises(HTTPError) as caught:
+                    self.post(f"/api/previews/{job['id']}/source", point, token="invalid")
+                self.assertEqual(caught.exception.code, 403)
         queued = self.post("/api/import", {"edits": [{"path": "main.tex", "search": "Original manuscript.",
                                                    "replace": "\\ThisCommandDoesNotExist"}]})
         bad = self.post(f"/api/queue/{queued['id']}/open", {})["proposal"]

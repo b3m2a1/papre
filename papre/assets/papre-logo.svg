@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="papre-logo-title papre-logo-desc">
+  <title id="papre-logo-title">Paper Patch Review Editor</title>
+  <desc id="papre-logo-desc">An offset fountain pen nib over the green update panel of a red and green split review, with a light gray toolbar and straight gray text lines.</desc>
+  <defs>
+    <clipPath id="papre-review-frame">
+      <rect x="20" y="54" width="216" height="184" rx="18"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#papre-review-frame)">
+    <rect x="20" y="54" width="216" height="184" fill="#eef0f2"/>
+    <rect x="20" y="90" width="108" height="148" fill="#fde2e1"/>
+    <rect x="128" y="90" width="108" height="148" fill="#dff4e6"/>
+    <path d="M20 90H236M128 90V238" fill="none" stroke="#c9d0d6" stroke-width="2"/>
+  </g>
+  <g fill="#aeb7bf">
+    <circle cx="38" cy="72" r="3"/>
+    <circle cx="51" cy="72" r="3"/>
+    <rect x="65" y="69" width="36" height="6" rx="2"/>
+    <rect x="214" y="68" width="8" height="8" rx="1"/>
+  </g>
+  <g fill="#89939c">
+    <rect x="38" y="108" width="70" height="6" rx="1"/>
+    <rect x="38" y="135" width="59" height="6" rx="1"/>
+    <rect x="38" y="162" width="72" height="6" rx="1"/>
+    <rect x="38" y="189" width="52" height="6" rx="1"/>
+    <rect x="38" y="216" width="66" height="6" rx="1"/>
+    <rect x="146" y="108" width="71" height="6" rx="1"/>
+    <rect x="146" y="135" width="60" height="6" rx="1"/>
+    <rect x="146" y="162" width="72" height="6" rx="1"/>
+    <rect x="146" y="189" width="58" height="6" rx="1"/>
+    <rect x="146" y="216" width="68" height="6" rx="1"/>
+  </g>
+  <rect x="20" y="54" width="216" height="184" rx="18" fill="none" stroke="#4b5660" stroke-width="3"/>
+  <g transform="translate(208 19) rotate(23)">
+    <path d="M0 0L34 94L0 147L-34 94Z" fill="#26313b" stroke="#ffffff" stroke-width="4.5" stroke-linejoin="round"/>
+    <path d="M0 7V83" fill="none" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round"/>
+    <circle cy="92" r="7" fill="#ffffff"/>
+  </g>
+</svg>

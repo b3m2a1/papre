@@ -1,8 +1,10 @@
 import {$, $$, node, button} from './components.js';
-import './layout.js';
+import {revealPreview} from './layout.js';
 let session, entry = null, proposal = null, sourcePath = null, busy = false, lastBuild = null, directory = null;
 let importFilename = null, warningEntry = null, toastTimer, polling = false, opening = 0, buildGeneration = 0, queueGeneration = 0;
 const drafts = new Map(), editing = new Set(), expanded = new Set();
+let previewRun = null, previewRequests = Promise.resolve(), waitingForPreview = false;
+let focusedChange = null, pdfTarget = '';
 function toast(message, error = false) {
   $('#toast').textContent = message; $('#toast').classList.toggle('error', error); $('#toast').hidden = false;
   clearTimeout(toastTimer); toastTimer = setTimeout(() => { $('#toast').hidden = true; }, error ? 10000 : 4000);
@@ -20,12 +22,12 @@ function safeNavigate() {
 }
 const hunks = () => proposal ? proposal.files.flatMap(file => file.hunks) : [];
 const activeEntries = () => session.queue.entries.filter(item => !item.path.includes('/') && item.status !== 'skipped');
-function previewStale() { if (lastBuild) $('#build-badge').textContent = 'Recompile to update'; }
+function previewStale() { if (lastBuild && !previewRun) $('#build-badge').textContent = 'Recompile to update'; }
 async function refreshSession() {
   const next = await api('/api/session');
   const changedRepo = session && session.repo_key !== next.repo_key;
   session = next;
-  if (changedRepo) { entry = proposal = sourcePath = null; drafts.clear(); editing.clear(); expanded.clear(); lastBuild = null; }
+  if (changedRepo) { invalidatePreview(); waitingForPreview = false; entry = proposal = sourcePath = null; drafts.clear(); editing.clear(); expanded.clear(); lastBuild = null; clearPreview(); }
   $('#repo-path').textContent = session.repo?.root || 'No repository selected';
   $('#branch').textContent = session.repo?.branch || '';
   $('#repo-state').textContent = session.repo ? (session.repo.dirty ? 'Modified' : 'Clean') : '';
@@ -73,6 +75,7 @@ function renderNav() {
   }
 }
 async function openEntry(id) {
+  invalidatePreview();
   const generation = ++queueGeneration; opening++;
   try {
     const result = await api(`/api/queue/${id}/open`, {});
@@ -82,9 +85,10 @@ async function openEntry(id) {
     $('#preview-selection').value = proposal?.status === 'reviewing' ? 'proposed' : 'working';
     await refreshSession();
     if (generation !== queueGeneration) return;
-    renderReview(); previewStale();
+    renderReview(); warmPreview();
     if (result.warning) showWarning(id, result.warning);
-  } finally { opening--; }
+  } catch (error) { cancelBackgroundPreview(); throw error; }
+  finally { opening--; }
 }
 function showWarning(id, message) {
   warningEntry = id; $('#warning-text').textContent = message;
@@ -119,7 +123,7 @@ function renderReview() {
   }
   for (const file of proposal.files) {
     const diff = node('review-diff'); $('#changes').append(diff);
-    diff.model = {file, context: $('#context-size').value, active, busy, drafts, editing, expanded};
+    diff.model = {file, context: $('#context-size').value, active, busy, drafts, editing, expanded, locations: previewLocations()};
   }
   $('#apply').hidden = proposal.status !== 'reviewing'; $('#undo').hidden = proposal.status !== 'applied';
   $('#apply').disabled = !active || busy || !session.allow_write || counts.pending > 0 || counts.accepted === 0 || drafts.size > 0;
@@ -130,6 +134,7 @@ function renderReview() {
   $('#apply-note').textContent = drafts.size ? 'Save or cancel your update edit.' : !session.allow_write ? 'Apply is disabled. Enable it when attaching the repository.' :
     proposal.status === 'reviewing' ? 'Review decisions are saved. Manuscript source changes only when you click Apply.' : 'Review history is retained.';
   previewHint();
+  updatePdfLocations();
 }
 $('#changes').addEventListener('open-source', event => {
   if (safeNavigate()) showSource(event.detail).catch(error => toast(error.message, true));
@@ -138,19 +143,22 @@ $('#changes').addEventListener('draft-change', () => { $('#apply').disabled = tr
 $('#changes').addEventListener('review-action', event => {
   const {action, id, decision, new: update} = event.detail;
   const hunk = hunks().find(h => h.id === id);
-  if (action === 'edit') { editing.add(id); renderReview(); $(`article[data-hunk="${id}"] textarea`)?.focus(); }
+  if (action === 'preview-section') scrollToPdf(id);
+  else if (action === 'edit') { editing.add(id); renderReview(); $(`article[data-hunk="${id}"] textarea`)?.focus(); }
   else if (action === 'cancel') { editing.delete(id); drafts.delete(id); renderReview(); }
   else if (action === 'save') updateDecisions([{id, new: update, decision: update === hunk.new ? hunk.decision : 'pending'}]);
   else if (action === 'decision') updateDecisions([{id, decision, ...(drafts.has(id) ? {new: drafts.get(id)} : {})}]);
 });
 async function updateDecisions(decisions) {
   if (busy) return; busy = true; queueGeneration++;
+  invalidatePreview();
   try {
     const result = await api(`/api/queue/${entry.id}/review`, {revision: proposal.revision, decisions});
     entry = result.entry; proposal = result.proposal;
     for (const decision of decisions) { drafts.delete(decision.id); editing.delete(decision.id); }
-    await refreshSession(); previewStale();
+    await refreshSession(); warmPreview();
   } catch (error) {
+    cancelBackgroundPreview();
     toast(error.message, true);
     if (/changed since import|could not be applied|does not apply/.test(error.message)) showWarning(entry.id, error.message);
   } finally { busy = false; renderReview(); }
@@ -164,15 +172,16 @@ for (const action of ['apply', 'undo']) $('#' + action).addEventListener('click'
   try {
     const result = await api(`/api/queue/${entry.id}/${action}`, {revision: proposal.revision});
     entry = result.entry; proposal = result.proposal; await refreshSession();
-    $('#preview-selection').value = 'working'; previewStale(); toast(action === 'apply' ? 'Accepted changes applied.' : 'Apply undone.');
+    $('#preview-selection').value = 'working'; warmPreview(); toast(action === 'apply' ? 'Accepted changes applied.' : 'Apply undone.');
   } catch (error) { toast(error.message, true); if (action === 'apply' && /changed since import|does not apply/.test(error.message)) showWarning(entry.id, error.message); }
   finally { busy = false; renderReview(); }
 });
 async function nextEntry(exclude = entry?.id) {
+  invalidatePreview();
   const next = activeEntries().find(item => item.id !== exclude);
   entry = proposal = null; sourcePath = null;
   if (next) await openEntry(next.id);
-  else { sessionStorage.removeItem('review-entry:' + session.repo_key); renderReview(); }
+  else { sessionStorage.removeItem('review-entry:' + session.repo_key); renderReview(); cancelBackgroundPreview(); }
 }
 async function skipEntry(id) {
   if (busy || !safeNavigate()) return;
@@ -318,60 +327,210 @@ function previewHint() {
   if (!session) return;
   const selection = $('#preview-selection').value, requires = selection !== 'working';
   $('#compile').disabled = !session.repo || !session.compiler.latexmk || !session.compiler.engines.length || !$('#main-file').value ||
-    (requires && (!proposal || proposal.status !== 'reviewing' || entry?.status === 'invalid'));
+    waitingForPreview || (requires && (!proposal || proposal.status !== 'reviewing' || entry?.status === 'invalid'));
   $('#preview-note').textContent = !session.compiler.can_compile ? 'Install latexmk and a LaTeX engine, then restart papre. Review works without PDF compilation.' : selection === 'working' ? 'Current repository files.' :
     selection === 'accepted' ? 'Only accepted changes.' : 'Accepted and pending changes; rejected changes are excluded.';
   if (lastBuild && (lastBuild.selection !== selection || lastBuild.main !== $('#main-file').value || lastBuild.engine !== $('#engine').value)) previewStale();
 }
-for (const id of ['main-file', 'preview-selection', 'engine']) $('#' + id).addEventListener('change', previewHint);
+for (const id of ['main-file', 'preview-selection', 'engine', 'compile-strict']) $('#' + id).addEventListener('change', () => { previewHint(); updatePdfLocations(); warmPreview(); });
 $('#toggle-log').addEventListener('click', () => { $('#build-log').hidden = !$('#build-log').hidden; $('#toggle-log').label = $('#build-log').hidden ? 'Show log' : 'Hide log'; });
 $('#pdf-zoom').addEventListener('change', () => {
   $('#pdf-pages').classList.remove('zoom-125', 'zoom-150', 'zoom-200');
   if ($('#pdf-zoom').value !== 'fit') $('#pdf-pages').classList.add('zoom-' + $('#pdf-zoom').value);
 });
-$('#compile').addEventListener('click', async () => {
+function previewOptions() {
+  if (!session?.repo || !session.compiler.can_compile || !$('#main-file').value) return null;
+  const selection = $('#preview-selection').value;
+  if (selection !== 'working' && (!proposal || proposal.status !== 'reviewing' || entry?.status === 'invalid')) return null;
+  return {main: $('#main-file').value, engine: $('#engine').value, selection,
+    proposal: selection === 'working' ? null : proposal?.id,
+    revision: selection === 'working' ? null : proposal?.revision, strict: $('#compile-strict').checked};
+}
+function invalidatePreview() {
+  buildGeneration++; previewRun = null; previewStale();
+}
+function cancelBackgroundPreview() {
+  invalidatePreview(); waitingForPreview = false; $('#compile').label = 'Compile preview'; previewHint();
+  const repository = session?.repo_key;
+  if (repository) previewRequests = previewRequests.catch(() => {}).then(() => {
+    if (session.repo_key === repository && !previewRun) return api('/api/previews/cancel', {});
+  }).catch(() => {});
+}
+function warmPreview() {
+  if (!proposal || entry?.status === 'invalid' || !previewOptions()) { cancelBackgroundPreview(); return; }
+  requestPreview();
+}
+function waitingLabel() {
+  waitingForPreview = true; $('#compile').label = 'Compiling…'; $('#compile').disabled = true;
+  $('#build-badge').textContent = 'Waiting for latest preview';
+}
+function requestPreview(show = false) {
+  const options = previewOptions(); if (!options) return Promise.resolve();
+  const repository = session.repo_key, key = JSON.stringify({repository, ...options});
+  if (previewRun?.key === key && !previewRun.done) {
+    if (show) { previewRun.show = true; waitingLabel(); }
+    return previewRun.promise;
+  }
+  const run = {key, generation: ++buildGeneration, show: show || waitingForPreview, job: null, done: false};
+  previewRun = run; previewStale();
+  if (run.show) waitingLabel(); else $('#build-badge').textContent = 'Compiling in background';
+  // Serialize submissions so a slow earlier HTTP request cannot preempt a newer selection.
+  const submitted = previewRequests.catch(() => {}).then(() => {
+    if (run.generation !== buildGeneration || session.repo_key !== repository) return null;
+    return api('/api/previews', options);
+  });
+  previewRequests = submitted;
+  run.promise = submitted.then(job => {
+    if (job && run.generation === buildGeneration) { run.job = job; return pollBuild(run); }
+  }).catch(error => {
+    if (run.generation !== buildGeneration) return;
+    $('#build-badge').textContent = run.show ? 'Build failed' : 'Background preview unavailable';
+    if (run.show) { clearPreview(); $('#build-log').textContent = error.message; $('#build-log').hidden = false; toast(error.message, true); }
+  }).finally(() => {
+    run.done = true;
+    if (run.generation !== buildGeneration) return;
+    waitingForPreview = false; $('#compile').label = 'Compile preview'; previewHint();
+  });
+  return run.promise;
+}
+$('#compile').addEventListener('click', () => {
   if (drafts.size) { toast('Save or cancel the update edit before compiling.', true); return; }
-  const generation = ++buildGeneration; $('#compile').disabled = true; $('#compile').label = 'Compiling…'; $('#build-badge').textContent = 'Compiling';
-  $('#build-warning').hidden = true;
-  $('#pdf-pages').hidden = $('#pdf-frame').hidden = $('#open-pdf').hidden = $('#pdf-zoom-control').hidden = true; $('#pdf-empty').hidden = false;
-  try {
-    const job = await api('/api/previews', {main: $('#main-file').value, engine: $('#engine').value,
-      selection: $('#preview-selection').value, proposal: proposal?.id, revision: proposal?.revision, strict: $('#compile-strict').checked});
-    await pollBuild(job.id, generation);
-  } catch (error) {
-    if (generation !== buildGeneration) return;
-    $('#build-badge').textContent = 'Build failed'; $('#build-log').textContent = error.message; $('#build-log').hidden = false; toast(error.message, true);
-  } finally { if (generation === buildGeneration) { $('#compile').label = 'Compile preview'; previewHint(); } }
+  $('#preview-settings').close(false);
+  $('#toggle-preview-settings').control.focus();
+  requestPreview(true);
 });
-async function pollBuild(id, generation) {
-  while (generation === buildGeneration) {
-    const job = await api('/api/previews/' + id); if (generation !== buildGeneration) return;
-    $('#build-log').textContent = job.log;
-    if (job.status === 'running') { await new Promise(resolve => setTimeout(resolve, 800)); continue; }
-    lastBuild = job;
-    if (job.status === 'succeeded' || job.status === 'with_errors') {
-      $('#build-badge').textContent = job.status === 'with_errors' ? 'Preview with errors' : `${job.seconds}s · Ready`;
-      if (job.status === 'with_errors') {
-        $('#build-warning').textContent = (job.error ? job.error + ' ' : '') + 'LaTeX reported errors. This preview may be incomplete; check the log.';
-        $('#build-warning').hidden = false; $('#build-log').hidden = false; $('#toggle-log').label = 'Hide log';
-      }
-      if (job.pages?.length) {
-        $('#pdf-pages').replaceChildren();
-        job.pages.forEach((url, index) => { const figure = node('figure', 'pdf-page'), image = node('img');
-          image.src = url; image.alt = `PDF page ${index + 1}`; image.loading = index === 0 ? 'eager' : 'lazy';
-          figure.append(image, node('figcaption', '', `Page ${index + 1} of ${job.pages.length}`)); $('#pdf-pages').append(figure); });
-        $('#pdf-pages').hidden = $('#pdf-zoom-control').hidden = false;
-      } else { $('#pdf-frame').src = job.pdf; $('#pdf-frame').hidden = false; }
-      $('#pdf-empty').hidden = true; $('#open-pdf').href = job.pdf; $('#open-pdf').hidden = false;
-      if (job.selection !== 'working' && (proposal?.id !== job.proposal || proposal?.revision !== job.revision)) previewStale();
-    } else {
-      $('#build-badge').textContent = 'Build failed'; $('#build-log').hidden = false; $('#toggle-log').label = 'Hide log';
-      $('#build-warning').textContent = job.error || 'LaTeX produced no new PDF. Check the compilation log.';
-      $('#build-warning').hidden = false; toast('Compilation failed. See the log.', true);
+async function pollBuild(run) {
+  while (run.generation === buildGeneration) {
+    const job = await api('/api/previews/' + run.job.id);
+    if (run.generation !== buildGeneration) return;
+    run.job = job;
+    if (run.show) $('#build-log').textContent = job.log;
+    if (job.status === 'running') { await new Promise(resolve => setTimeout(resolve, 300)); continue; }
+    if (job.status === 'cancelled') { $('#build-badge').textContent = 'Preview cancelled'; return; }
+    if (run.show || ['succeeded', 'with_errors'].includes(job.status)) displayBuild(job);
+    else {
+      $('#build-badge').textContent = 'Background build failed';
+      $('#build-log').textContent = job.log;
     }
     return;
   }
 }
+function clearPreview() {
+  $('#pdf-pages').hidden = $('#pdf-frame').hidden = $('#open-pdf').hidden = $('#pdf-zoom-control').hidden = true;
+  $('#pdf-empty').hidden = false; $('#pdf-frame').removeAttribute('src');
+  pdfTarget = ''; $('#pdf-location').hidden = true;
+}
+function displayBuild(job) {
+  lastBuild = job; pdfTarget = ''; $('#build-warning').hidden = true; $('#build-log').textContent = job.log;
+  const uncolored = (job.changes || []).filter(change => change.decision === 'pending' && change.note).length;
+  $('#annotation-note').textContent = 'Pending prose edits are green in Proposed changes; accepted and rejected edits have no review color. ' +
+    (uncolored ? `${uncolored} source change(s) could not be colored safely. ` : '') +
+    'Double-click changed text in Rendered pages to return to its review section. Browser PDF uses page fragments; browser support varies. ' +
+    (job.warnings || []).filter(warning => /coloring|SyncTeX|locations/.test(warning)).join(' ');
+  if (job.status === 'succeeded' || job.status === 'with_errors') {
+    $('#build-badge').textContent = job.status === 'with_errors' ? 'Preview with errors' : `${job.seconds}s · Ready`;
+    if (job.status === 'with_errors') {
+      $('#build-warning').textContent = (job.error ? job.error + ' ' : '') + 'LaTeX reported errors. This preview may be incomplete; check the log.';
+      $('#build-warning').hidden = false; $('#build-log').hidden = false; $('#toggle-log').label = 'Hide log';
+    }
+    $('#pdf-pages').replaceChildren();
+    (job.pages || []).forEach((url, index) => { const figure = node('figure', 'pdf-page'), image = node('img');
+      image.src = url; image.alt = `PDF page ${index + 1}`; image.loading = index === 0 ? 'eager' : 'lazy';
+      image.dataset.page = String(index + 1);
+      if (job.synctex_path && job.changes?.length) {
+        image.dataset.sourceNavigation = 'true';
+        image.title = 'Double-click changed text to return to its review section';
+      }
+      figure.append(image, node('figcaption', '', `Page ${index + 1} of ${job.pages.length}`)); $('#pdf-pages').append(figure); });
+    $('#pdf-empty').hidden = true; $('#open-pdf').href = job.pdf; $('#open-pdf').hidden = false; selectPdfViewer();
+    revealPreview();
+    updatePdfLocations();
+    if (job.selection !== 'working' && (proposal?.id !== job.proposal || proposal?.revision !== job.revision)) previewStale();
+  } else {
+    clearPreview();
+    $('#build-badge').textContent = 'Build failed'; $('#build-log').hidden = false; $('#toggle-log').label = 'Hide log';
+    $('#build-warning').textContent = job.error || 'LaTeX produced no new PDF. Check the compilation log.';
+    $('#build-warning').hidden = false; toast('Compilation failed. See the log.', true);
+  }
+}
+try { $('#pdf-viewer').value = localStorage.getItem('papre.pdf-viewer') === 'pages' ? 'pages' : 'browser'; } catch { /* Optional preference. */ }
+function selectPdfViewer() {
+  if (!lastBuild || !['succeeded', 'with_errors'].includes(lastBuild.status)) return;
+  const pages = $('#pdf-viewer').value === 'pages' && lastBuild.pages?.length;
+  $('#pdf-pages').hidden = $('#pdf-zoom-control').hidden = !pages;
+  $('#pdf-frame').hidden = Boolean(pages);
+  const url = lastBuild.pdf + pdfTarget;
+  if (!pages && $('#pdf-frame').getAttribute('src') !== url) $('#pdf-frame').src = url;
+}
+function previewLocations() {
+  const current = lastBuild && lastBuild.pdf && lastBuild.proposal === proposal?.id && lastBuild.revision === proposal?.revision &&
+    lastBuild.main === $('#main-file').value && lastBuild.selection === $('#preview-selection').value &&
+    lastBuild.engine === $('#engine').value && lastBuild.strict === $('#compile-strict').checked;
+  return current ? Object.fromEntries((lastBuild.changes || []).map(change => [change.id, change])) : {};
+}
+function updatePdfLocations() {
+  const locations = previewLocations();
+  for (const diff of $$('#changes review-diff')) diff.locations = locations;
+  const selected = locations[focusedChange] || Object.values(locations).find(change => change.page && change.decision === 'pending') ||
+    Object.values(locations).find(change => change.page);
+  $('#pdf-location').hidden = !selected?.page;
+  if (selected?.page) {
+    $('#pdf-location').textContent = `PDF p. ${selected.page} · source ¶ ${selected.paragraph}`;
+    $('#pdf-location').title = `${selected.path}:${selected.line}; source paragraphs are separated by blank lines. This is the selected change's location, not the viewer's current page.`;
+  }
+}
+function scrollToPdf(id) {
+  const location = previewLocations()[id];
+  if (!location?.page) { toast('Compile a matching preview to locate this change.'); return; }
+  focusedChange = id; updatePdfLocations();
+  if ($('#preview-pane').hidden) $('#toggle-preview').click();
+  if (!$('#pdf-pages').hidden) {
+    const image = $(`#pdf-pages img[data-page="${location.page}"]`);
+    if (!image) { toast(`This change is on PDF page ${location.page}. Use Open PDF for pages beyond the rendered preview.`); return; }
+    const position = () => {
+      const ratio = location.y / (image.naturalHeight * 72 / 120);
+      $('#pdf-pages').scrollTop = image.offsetTop + ratio * image.clientHeight - 50;
+    };
+    if (image.complete) position(); else image.addEventListener('load', position, {once: true});
+  } else {
+    // Native PDF plugins expose no portable scrolling API; retain their own viewer.
+    pdfTarget = '#page=' + location.page;
+    $('#pdf-frame').src = lastBuild.pdf + pdfTarget;
+    $('#open-pdf').href = lastBuild.pdf + pdfTarget;
+  }
+}
+function focusReviewSection(id) {
+  const section = $$('article[data-hunk]').find(item => item.dataset.hunk === id);
+  if (!section) return;
+  sourcePath = null; $('#source-view').hidden = true; $('#review-view').hidden = false;
+  // Restore the review column when PDF is expanded, without hiding the PDF.
+  if ($('.app-layout').classList.contains('pdf-expanded')) $('#expand-preview').click();
+  focusedChange = id; updatePdfLocations();
+  section.scrollIntoView({block: 'center', behavior: 'smooth'});
+  section.classList.add('pdf-linked'); section.tabIndex = -1; section.focus({preventScroll: true});
+  setTimeout(() => section.classList.remove('pdf-linked'), 2500);
+  history.replaceState(null, '', '#change-' + id);
+}
+$('#pdf-pages').addEventListener('dblclick', async event => {
+  const image = event.target.closest('img[data-source-navigation]');
+  const build = lastBuild;
+  if (!image || !build || !Object.keys(previewLocations()).length) return;
+  const bounds = image.getBoundingClientRect();
+  try {
+    const result = await api(`/api/previews/${build.id}/source`, {page: Number(image.dataset.page),
+      x: (event.clientX - bounds.left) / bounds.width, y: (event.clientY - bounds.top) / bounds.height});
+    if (lastBuild?.id !== build.id || proposal?.id !== result.proposal || proposal?.revision !== result.revision) return;
+    focusReviewSection(result.hunk);
+  } catch (error) { toast(error.message); }
+});
+window.addEventListener('hashchange', () => {
+  const id = location.hash.startsWith('#change-') ? location.hash.slice(8) : null;
+  if (id && hunks().some(hunk => hunk.id === id)) focusReviewSection(id);
+});
+$('#pdf-viewer').addEventListener('change', () => {
+  try { localStorage.setItem('papre.pdf-viewer', $('#pdf-viewer').value); } catch { /* Optional preference. */ }
+  selectPdfViewer();
+});
 window.addEventListener('beforeunload', event => { if (drafts.size) { event.preventDefault(); event.returnValue = ''; } });
 setInterval(async () => {
   if (!session?.repo || polling || busy || opening) return;
@@ -385,7 +544,7 @@ setInterval(async () => {
       (current.revision && current.revision !== proposal?.revision))) {
       await openEntry(entry.id);
     } else if (entry && !current && !drafts.size) {
-      entry = proposal = null; if (!sourcePath) renderReview();
+      entry = proposal = null; cancelBackgroundPreview(); if (!sourcePath) renderReview();
     }
   } catch { /* A manual refresh reports connection errors without interrupting editing. */ }
   finally { polling = false; }

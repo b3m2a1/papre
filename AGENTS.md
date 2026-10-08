@@ -63,6 +63,30 @@ queue when that location and action are authorized by the user's request.
   retain disabled shell escape and compiler timeouts. A new PDF from an errored
   build is allowed as an explicitly marked error preview, never as a clean success.
   Reject incomplete outputs and never reuse a manuscript PDF as a failed build's output.
+- Prepare previews when a patch opens or saved review content changes. Keep one
+  compiler/rendering worker per repository; newer requests preempt older process
+  groups and discard intermediate queued builds. Reuse only matching settings,
+  review revisions, and repository inputs. A cancelled build must never publish
+  output or replace the current preview. Stop workers before closing their stores.
+- Display the latest completed preview automatically and reveal the first ready PDF
+  by default. Respect an explicitly hidden preview pane; completed builds must still
+  update its contents. Preserve generation guards so stale builds cannot replace it.
+- Keep the PDF viewport free of outer padding. The main document, Open PDF link,
+  expand/restore icon, and settings hamburger belong in its compact toolbar. Icons
+  need tooltips and accessible labels. Viewer selection, rendered-page zoom, settings,
+  and the log use the shared overlay drawer, closed by default; opening it must not
+  resize the PDF. Support outside-click and Escape dismissal with keyboard focus.
+- Preserve the browser PDF iframe and rendered-page alternative. Switching viewers
+  should reuse the displayed PDF, without changing review state or recompiling it.
+- Color only pending safe prose in disposable proposed-preview snapshots. Never add
+  annotation markup to manuscript source or exported patches; accepted/rejected edits
+  have no review color. Retry unmarked compilation if markup causes an error, within
+  the original timeout. Leave unsafe TeX constructs unmarked and explain the limitation.
+- Preserve the native PDF plugin. Use optional SyncTeX for change locations and page
+  fragments for native page jumps; do not overlay it or claim to capture its mouse events.
+  Double-click source navigation belongs in Rendered pages. Guard coordinates, source
+  paths, repository identity and review revisions. Strip SYNCTEX_EDITOR/SYNCTEX_VIEWER
+  before queries so mapping never launches a configured external command.
 - Preserve path and symlink guards, loopback binding, request-token and origin
   checks, repository identity checks, durable decisions, and revision guards.
 - Render source and patch content as text, never as trusted HTML.
@@ -72,10 +96,13 @@ queue when that location and action are authorized by the user's request.
 - `papre/core.py`: source validation, patch import, decisions, Apply/Undo, history.
 - `papre/queue.py`: discovery, enqueue, version backups, processing, and receipts.
 - `papre/preview.py`: compilation snapshots, logs, PDFs, and page rendering.
+- `papre/annotations.py`: preview-only coloring, source paragraph ranges, SyncTeX records.
 - `papre/server.py`: HTTP API, repository picker, and launch configuration.
 - `papre/picker.py`: native operating-system folder selection; keep HTTP token checks,
   explicit `--browse-root` restrictions, cancellation, and the in-page fallback.
 - `papre/static/`: shared UI components and browser workflow.
+- `papre/assets/`: self-contained toolbar logo and favicon assets. Keep the favicon's
+  simplified small-size drawing and include assets in wheels and source distributions.
 - `tests/`: disposable-repository tests and optional browser verification.
 
 Use Python 3.11+ from the chosen development environment. From the project root:
@@ -88,7 +115,7 @@ python -m unittest discover -s tests -v
 The distribution, import package, and installed command are named `papre`.
 `papre --check` reports available Git, LaTeX engines, and PDF tools. Keep runtime
 state in the user data directory or an explicit `--state-dir`; never write it
-beside installed package files. Include static assets and demo fixtures when
+beside installed package files. Include static files, logo assets, and demo fixtures when
 changing distribution configuration, and verify an installed build works from
 an unrelated working directory.
 

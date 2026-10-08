@@ -42,6 +42,7 @@ def available_tools() -> dict:
     renderer = "pdftoppm" if renderer_path and Path(renderer_path).stem.lower() == "pdftoppm" else "gs" if renderer_path else None
     return {"git": shutil.which("git"), "latexmk": latexmk, "engines": list(engine_paths),
             "engine_paths": engine_paths, "renderer": renderer, "renderer_path": renderer_path,
+            "synctex": shutil.which("synctex"),
             "can_compile": bool(latexmk and engine_paths), "installation": installation_help()}
 
 
@@ -53,6 +54,7 @@ def print_tool_status():
     for engine in ENGINES:
         print(engine + ": " + (tools["engine_paths"].get(engine) or "not found"))
     print("PDF renderer: " + (tools["renderer_path"] or "not found; using the browser PDF viewer"))
+    print("PDF source navigation: " + (tools["synctex"] or "synctex not found; page locations unavailable"))
     if not tools["can_compile"]:
         print("PDF preview needs latexmk and at least one detected LaTeX engine.")
         print(tools["installation"]["text"])

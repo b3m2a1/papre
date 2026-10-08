@@ -12,8 +12,21 @@ export function button(label, onClick, variant = 'default') {
   if (onClick) element.addEventListener('click', onClick);
   return element;
 }
+const iconPaths = {
+  expand: 'M6 2H2V6M2 2L6 6M10 2H14V6M14 2L10 6M14 10V14H10M14 14L10 10M6 14H2V10M2 14L6 10',
+  restore: 'M2 6H6V2M2 2L6 6M10 2V6H14M14 2L10 6M14 10H10V14M14 14L10 10M6 14V10H2M2 14L6 10',
+};
+function buttonIcon(name) {
+  if (name === 'menu') return node('span', 'button-icon menu-icon');
+  if (!iconPaths[name]) return null;
+  const glyph = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  for (const [key, value] of Object.entries({viewBox: '0 0 16 16', class: 'button-icon', fill: 'none',
+    stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round'})) glyph.setAttribute(key, value);
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', iconPaths[name]); glyph.append(path); return glyph;
+}
 class UIButton extends HTMLElement {
-  static observedAttributes = ['label', 'disabled', 'variant', 'pressed', 'detail', 'expanded', 'controls'];
+  static observedAttributes = ['label', 'disabled', 'variant', 'pressed', 'detail', 'expanded', 'controls', 'icon'];
   connectedCallback() { this.render(); }
   attributeChangedCallback() { if (this.isConnected) this.render(); }
   get disabled() { return this.hasAttribute('disabled'); }
@@ -27,6 +40,12 @@ class UIButton extends HTMLElement {
     this.control.className = 'ui-button ' + (this.getAttribute('variant') || 'default');
     this.control.disabled = this.disabled;
     this.control.replaceChildren(node('span', 'button-label', this.label));
+    const glyph = buttonIcon(this.getAttribute('icon'));
+    if (glyph) {
+      this.control.firstChild.classList.add('visually-hidden');
+      glyph.setAttribute('aria-hidden', 'true');
+      this.control.append(glyph); this.control.title = this.label;
+    } else this.control.removeAttribute('title');
     const detail = this.getAttribute('detail');
     if (detail) this.control.append(node('small', 'button-detail', detail));
     if (this.hasAttribute('pressed')) this.control.setAttribute('aria-pressed', this.getAttribute('pressed'));
@@ -97,9 +116,69 @@ class UIDialog extends HTMLElement {
   close() { this.control.close(); }
   get open() { return Boolean(this.control?.open); }
 }
+class UIDrawer extends HTMLElement {
+  connectedCallback() {
+    if (!this.panel) {
+      const content = [...this.childNodes];
+      this.panel = node('section', 'ui-drawer-panel'); this.panel.tabIndex = -1;
+      this.panel.setAttribute('role', 'dialog');
+      this.panel.setAttribute('aria-label', this.getAttribute('label') || 'Settings');
+      const header = node('div', 'drawer-header');
+      header.append(node('h2', '', this.getAttribute('label') || 'Settings'), button('Close', () => this.close()));
+      const backdrop = button('Close settings', () => this.close(), 'backdrop');
+      backdrop.className = 'drawer-backdrop'; backdrop.setAttribute('aria-hidden', 'true');
+      this.panel.append(header, ...content); this.replaceChildren(backdrop, this.panel); this.hidden = true;
+      backdrop.control.tabIndex = -1;
+      // Native PDF plugins can intercept clicks beneath ordinary DOM overlays.
+      // Use the browser's top layer when available, retaining the in-page fallback.
+      if (typeof this.showPopover === 'function') this.setAttribute('popover', 'manual');
+    }
+    this.outside = event => {
+      if (!this.open || this.panel.contains(event.target) || this.opener?.contains(event.target)) return;
+      this.close(this.contains(event.target));
+    };
+    this.escape = event => {
+      if (this.open && event.key === 'Escape' && !event.defaultPrevented) {
+        event.preventDefault(); this.close();
+      }
+    };
+    document.addEventListener('pointerdown', this.outside);
+    document.addEventListener('keydown', this.escape);
+    this.reposition = () => this.position();
+    this.observer = new ResizeObserver(this.reposition); this.observer.observe(this.parentElement);
+    window.addEventListener('scroll', this.reposition, true);
+  }
+  disconnectedCallback() {
+    document.removeEventListener('pointerdown', this.outside);
+    document.removeEventListener('keydown', this.escape);
+    this.observer?.disconnect(); window.removeEventListener('scroll', this.reposition, true);
+  }
+  show(opener) {
+    if (this.open) return;
+    this.opener = opener || document.activeElement; this.hidden = false;
+    this.position();
+    if (this.hasAttribute('popover')) this.showPopover();
+    this.panel.focus({preventScroll: true}); this.emit();
+  }
+  close(restoreFocus = true) {
+    if (!this.open) return;
+    if (this.hasAttribute('popover')) this.hidePopover();
+    this.hidden = true;
+    if (restoreFocus && this.opener?.isConnected) this.opener.focus({preventScroll: true});
+    this.emit();
+  }
+  get open() { return !this.hidden; }
+  position() {
+    if (!this.open || !this.hasAttribute('popover')) return;
+    const box = this.parentElement.getBoundingClientRect();
+    Object.assign(this.style, {left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`, height: `${box.height}px`});
+  }
+  emit() { this.dispatchEvent(new CustomEvent('drawer-toggle', {bubbles: true, detail: {open: this.open}})); }
+}
 customElements.define('ui-button', UIButton);
 customElements.define('ui-field', UIField);
 customElements.define('ui-dialog', UIDialog);
+customElements.define('ui-drawer', UIDrawer);
 customElements.define('ui-splitter', UISplitter);
 export function splitLines(text) {
   if (!text) return [];
@@ -121,6 +200,19 @@ function cell(text, number, mark = '', kind = '') {
 }
 class ReviewDiff extends HTMLElement {
   set model(value) { this.data = value; this.render(); }
+  set locations(value) { this.data.locations = value; this.updateLocations(); }
+  updateLocations() {
+    for (const hunk of this.data.file.hunks) {
+      const section = [...this.querySelectorAll('article[data-hunk]')].find(item => item.dataset.hunk === hunk.id);
+      if (!section) continue;
+      const location = this.data.locations?.[hunk.id];
+      const label = section.querySelector('.change-location');
+      label.textContent = location?.page ? `PDF p. ${location.page} · source ¶ ${location.paragraph}` : 'PDF location unavailable';
+      label.title = location?.page ? `${location.path}:${location.line}. Paragraphs are numbered by blank lines in the selected source. ${location.deleted ? 'Deleted text: nearest surviving location.' : ''}` : 'Locations appear after a matching preview compiles. SyncTeX must be installed.';
+      if (location?.note) label.title += ' ' + location.note;
+      section.querySelector('.scroll-section').disabled = !location?.page;
+    }
+  }
   action(action, hunk, extra = {}) {
     this.dispatchEvent(new CustomEvent('review-action', {bubbles: true, detail: {action, id: hunk.id, ...extra}}));
   }
@@ -161,6 +253,9 @@ class ReviewDiff extends HTMLElement {
       const toolbar = node('div', 'hunk-toolbar'), meta = node('div', 'hunk-meta'), actions = node('div', 'hunk-actions');
       meta.append(node('span', '', `Change ${index + 1}`), node('span', 'decision', hunk.decision));
       if (hunk.new !== hunk.suggested) meta.append(node('span', '', 'edited'));
+      meta.append(node('span', 'change-location'));
+      const scroll = button('Scroll to Section', () => this.action('preview-section', hunk));
+      scroll.classList.add('scroll-section'); actions.append(scroll);
       for (const [name, decision] of [['Accept', 'accepted'], ['Reject', 'rejected'], ['Edit', null]]) {
         const control = button(name, () => this.action(decision ? 'decision' : 'edit', hunk, decision ? {decision} : {}), name.toLowerCase());
         control.disabled = !active || busy;
@@ -195,7 +290,7 @@ class ReviewDiff extends HTMLElement {
       }
       wrapper.append(section); offset += newLines.length - oldLines.length; cursor = hunk.end;
     });
-    equal(cursor, base.length, false, true); this.replaceChildren(wrapper);
+    equal(cursor, base.length, false, true); this.replaceChildren(wrapper); this.updateLocations();
   }
 }
 customElements.define('review-diff', ReviewDiff);

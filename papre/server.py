@@ -19,6 +19,16 @@ from .system import default_state_dir, print_tool_status
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = Path(__file__).resolve().parent / "static"
+ASSETS = Path(__file__).resolve().parent / "assets"
+ASSET_TYPES = {
+    "papre-logo.svg": "image/svg+xml",
+    "favicon.svg": "image/svg+xml",
+    "favicon.ico": "image/vnd.microsoft.icon",
+    "favicon-16.png": "image/png",
+    "favicon-32.png": "image/png",
+    "favicon-48.png": "image/png",
+    "favicon-64.png": "image/png",
+}
 DEMO = Path(__file__).resolve().parent / "demo"
 
 PROMPT = """Review this scientific LaTeX manuscript for the requested changes.
@@ -38,6 +48,7 @@ class ReviewHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, address, store=None, main="main.tex", demo=False, browse_root=None, state_base=None, browse_start=None):
         self.stores = []
+        self.preview_managers = []
         super().__init__(address, Handler)
         self.lock = threading.RLock()
         self.browse_root = Path(browse_root).expanduser().resolve() if browse_root else None
@@ -49,6 +60,7 @@ class ReviewHTTPServer(ThreadingHTTPServer):
         self.previews = PreviewManager(store) if store else None
         if store:
             self.stores.append(store)
+            self.preview_managers.append(self.previews)
         self.main = main
         self.demo = demo
         self.token = secrets.token_urlsafe(32)
@@ -96,10 +108,13 @@ class ReviewHTTPServer(ThreadingHTTPServer):
             store.close()
             raise
         with self.lock:
+            if self.previews:
+                self.previews.close()
             self.store, self.queue, self.previews = store, queue, previews
             self.main, self.demo = main, False
             self.token = secrets.token_urlsafe(32)
             self.stores.append(store)
+            self.preview_managers.append(previews)
         return self.session()
 
     def session(self):
@@ -117,6 +132,8 @@ class ReviewHTTPServer(ThreadingHTTPServer):
 
     def server_close(self):
         super().server_close()
+        for manager in self.preview_managers:
+            manager.close()
         for store in self.stores:
             store.close()
 
@@ -235,6 +252,12 @@ class Handler(BaseHTTPRequestHandler):
             if path in static_files:
                 filename, content_type = static_files[path]
                 return self.send((STATIC / filename).read_bytes(), content_type=content_type)
+            if path == "/favicon.ico":
+                return self.send((ASSETS / "favicon.ico").read_bytes(), content_type=ASSET_TYPES["favicon.ico"])
+            if path.startswith("/assets/"):
+                filename = path.removeprefix("/assets/")
+                if filename in ASSET_TYPES:
+                    return self.send((ASSETS / filename).read_bytes(), content_type=ASSET_TYPES[filename])
             raise ReviewError("Not found.", 404)
         except ReviewError as exc:
             self.send({"error": str(exc)}, exc.status)
@@ -291,9 +314,17 @@ class Handler(BaseHTTPRequestHandler):
                 if len(text.encode()) > 4 * 1024 * 1024:
                     raise ReviewError("Selected manuscript context is larger than 4 MB.")
                 return self.send({"text": text})
+            if path == "/api/previews/cancel":
+                self.server.previews.cancel()
+                return self.send({"cancelled": True})
             if path == "/api/previews":
                 return self.send(self.server.previews.start(data.get("main", ""), data.get("engine", "pdflatex"),
                                  data.get("selection", "working"), data.get("proposal"), data.get("revision"), data.get("strict", False)), 202)
+            if path.startswith("/api/previews/") and path.endswith("/source"):
+                parts = path.split("/")
+                if len(parts) != 5:
+                    raise ReviewError("Not found.", 404)
+                return self.send(self.server.previews.source_at(parts[3], data.get("page"), data.get("x"), data.get("y")))
             if path.startswith("/api/proposals/"):
                 parts = path.split("/")
                 if len(parts) != 5:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "papre"
-version = "0.3.3"
+version = "0.3.8"
 description = "Paper Patch Review Editor: review and edit LaTeX patches before applying them"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,4 +31,4 @@ include = ["papre*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-papre = ["static/*.html", "static/*.css", "static/*.js", "demo/*.tex", "demo/*.bib", "demo/*.patch", "demo/.gitignore"]
+papre = ["static/*.html", "static/*.css", "static/*.js", "assets/*.svg", "assets/*.ico", "assets/*.png", "demo/*.tex", "demo/*.bib", "demo/*.patch", "demo/.gitignore"]
