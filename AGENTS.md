@@ -55,6 +55,14 @@ queue when that location and action are authorized by the user's request.
   `review_queue/superseded/`.
 - Saving an edited patch preserves its previous version in `superseded`. The
   user must be able to reject the edited update afterward.
+- Double-clicking unchanged update/context lines or full-file source opens the
+  shared inline source-region editor. Keep its original column read-only. Bound
+  paragraph/section edits at existing hunks, derive new pending hunks against the
+  exact source baseline, and retain previous IDs and decisions. Source edits may
+  add another existing file to the current review, or create a queued review if
+  none is editable. Cancel discards unsaved text. Saving must preserve the previous
+  queue file and prepare a preview; it must never write manuscript source or Git's
+  index. Guard the source digest, review revision, paths, and external queue edits.
 - Once every change is accepted or rejected, the final accepted patch moves to
   `review_queue/processed/` with its review receipt. All-rejected patches are empty.
 - Apply changes only accepted source text, leaves Git's index unchanged, and
@@ -63,6 +71,11 @@ queue when that location and action are authorized by the user's request.
   retain disabled shell escape and compiler timeouts. A new PDF from an errored
   build is allowed as an explicitly marked error preview, never as a clean success.
   Reject incomplete outputs and never reuse a manuscript PDF as a failed build's output.
+- Compile from the selected main document's parent directory inside the snapshot,
+  passing its filename to latexmk. Use that same directory for unmarked retries
+  and SyncTeX queries. Resolve relative SyncTeX inputs from the build's recorded
+  directory, retain snapshot containment checks, and expose repository-relative
+  source paths. Keep compiler outputs in the separate build output directory.
 - Prepare previews when a patch opens or saved review content changes. Keep one
   compiler/rendering worker per repository; newer requests preempt older process
   groups and discard intermediate queued builds. Reuse only matching settings,
@@ -82,11 +95,17 @@ queue when that location and action are authorized by the user's request.
   annotation markup to manuscript source or exported patches; accepted/rejected edits
   have no review color. Retry unmarked compilation if markup causes an error, within
   the original timeout. Leave unsafe TeX constructs unmarked and explain the limitation.
+  Permit locally grouped color inside the true/false text arguments of ifthenelse
+  and three-argument ifthen, including nested branches. Do not color condition-test
+  arguments or allow arbitrary open macro groups; keep branch selection and source
+  line numbers intact. Verify with compiled conditional examples.
 - Preserve the native PDF plugin. Use optional SyncTeX for change locations and page
   fragments for native page jumps; do not overlay it or claim to capture its mouse events.
   Double-click source navigation belongs in Rendered pages. Guard coordinates, source
   paths, repository identity and review revisions. Strip SYNCTEX_EDITOR/SYNCTEX_VIEWER
   before queries so mapping never launches a configured external command.
+  Map unchanged preview lines back through insertion/deletion offsets before editing
+  source outside a hunk, and refuse source changes since the preview was compiled.
 - Preserve path and symlink guards, loopback binding, request-token and origin
   checks, repository identity checks, durable decisions, and revision guards.
 - Render source and patch content as text, never as trusted HTML.

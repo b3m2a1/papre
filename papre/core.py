@@ -174,6 +174,132 @@ class ReviewStore:
                 counts["total"] += 1
         return counts
 
+    @staticmethod
+    def _hunks(before: str, after: str, reason: str = "", offset: int = 0) -> list[dict]:
+        old_lines, new_lines = before.splitlines(keepends=True), after.splitlines(keepends=True)
+        hunks = []
+        for kind, i, j, a, b in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
+            if kind == "equal":
+                continue
+            new = "".join(new_lines[a:b])
+            hunks.append({"id": uuid.uuid4().hex[:12], "start": i + offset, "end": j + offset,
+                          "old": "".join(old_lines[i:j]), "new": new, "suggested": new,
+                          "context_before": "".join(old_lines[max(0, i - 2):i]),
+                          "context_after": "".join(old_lines[j:j + 2]),
+                          "decision": "pending", "reason": reason})
+        return hunks
+
+    def source_region(self, name: str, line: int, proposal_id=None, revision=None, scope="paragraph", expected_digest=None) -> dict:
+        """Return a source block bounded by existing review changes, never their updates."""
+        with self.lock:
+            proposal = None
+            if proposal_id is not None:
+                if not isinstance(proposal_id, str) or isinstance(revision, bool) or not isinstance(revision, int):
+                    raise ReviewError("Choose a review and its current revision.")
+                proposal = self.get(proposal_id)
+                self._editable(proposal, revision)
+                self.verify_base(proposal)
+            before = self.repo.read(name)
+            if expected_digest is not None and expected_digest != digest(before):
+                raise ReviewError("Source changed since it was displayed. Refresh the file before editing.", 409)
+            lines = before.splitlines(keepends=True)
+            if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= max(1, len(lines)):
+                raise ReviewError("Choose an existing source line.")
+            if not isinstance(scope, str) or scope not in {"paragraph", "section"}:
+                raise ReviewError("Choose paragraph or section context.")
+            index = line - 1
+            file = next((file for file in proposal["files"] if file["path"] == name), None) if proposal else None
+            low, high = 0, len(lines)
+            for hunk in file["hunks"] if file else []:
+                if hunk["start"] <= index < hunk["end"]:
+                    return {"path": name, "line": line, "hunk": hunk["id"],
+                            "proposal": proposal_id, "revision": revision}
+                if hunk["end"] <= index:
+                    low = max(low, hunk["end"])
+                elif hunk["start"] > index:
+                    high = min(high, hunk["start"])
+            start, end = index, min(index + 1, len(lines))
+            if scope == "paragraph":
+                while start > 0 and lines[start - 1].strip():
+                    start -= 1
+                while end < len(lines) and lines[end].strip():
+                    end += 1
+            else:
+                heading = re.compile(r"^\s*\\(?:part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?(?:\[|\{)")
+                while start > 0 and not heading.match(lines[start]):
+                    start -= 1
+                while end < len(lines) and not heading.match(lines[end]):
+                    end += 1
+            # Keep very long blocks manageable and keep every current hunk separate.
+            start, end = max(start, low, index - 199), min(end, high, index + 201)
+            return {"path": name, "line": line, "start": start, "end": end,
+                    "before": "".join(lines[start:end]), "base_digest": digest(before), "scope": scope,
+                    "proposal": proposal_id, "revision": revision}
+
+    def _source_edit(self, data: dict, proposal: dict | None) -> tuple[str, str, str, list[dict]]:
+        name = data.get("path")
+        before = self.repo.read(name)
+        if data.get("base_digest") != digest(before):
+            raise ReviewError("Source changed while this editor was open. Reopen the section before saving.", 409)
+        lines = before.splitlines(keepends=True)
+        start, end = data.get("start"), data.get("end")
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in (start, end)) or not 0 <= start <= end <= len(lines):
+            raise ReviewError("Invalid source section range.")
+        old, new = "".join(lines[start:end]), data.get("new")
+        if data.get("before") != old:
+            raise ReviewError("The section no longer matches its source. Reopen it before saving.", 409)
+        if not isinstance(new, str) or len(new.encode()) > MAX_SOURCE or "\r" in new or "\x00" in new:
+            raise ReviewError("Edited source must be LF text, at most 2 MB.")
+        # A block editor must not accidentally join its last line to untouched text.
+        if new and end < len(lines) and not new.endswith("\n"):
+            new += "\n"
+        file = next((file for file in proposal["files"] if file["path"] == name), None) if proposal else None
+        for hunk in file["hunks"] if file else []:
+            intersects = max(start, hunk["start"]) < min(end, hunk["end"])
+            encloses_insertion = start < hunk["start"] < end and hunk["start"] == hunk["end"]
+            if intersects or encloses_insertion:
+                raise ReviewError("This section overlaps a current change. Edit that change instead.", 409)
+        after = "".join(lines[:start]) + new + "".join(lines[end:])
+        if len(after.encode()) > MAX_SOURCE:
+            raise ReviewError("Edited source must be at most 2 MB.")
+        hunks = self._hunks(old, new, "Edited surrounding source.", start)
+        for fresh in hunks:
+            for hunk in file["hunks"] if file else []:
+                if fresh["start"] == fresh["end"] == hunk["start"] == hunk["end"]:
+                    raise ReviewError("An insertion already exists at this line. Edit that change instead.", 409)
+            fresh["context_before"] = "".join(lines[max(0, fresh["start"] - 2):fresh["start"]])
+            fresh["context_after"] = "".join(lines[fresh["end"]:fresh["end"] + 2])
+        return name, before, after, hunks
+
+    def edit_source(self, data: dict, proposal_id=None, revision=None) -> dict:
+        """Reconcile edits only into the review proposal; the repository stays untouched."""
+        with self.lock:
+            proposal = None
+            if proposal_id is not None:
+                if not isinstance(proposal_id, str) or isinstance(revision, bool) or not isinstance(revision, int):
+                    raise ReviewError("Choose a review and its current revision.")
+                proposal = self.get(proposal_id)
+                self._editable(proposal, revision)
+                self.verify_base(proposal)
+            name, before, after, hunks = self._source_edit(data, proposal)
+            if proposal is None:
+                return self.create({name: after}, "Edit " + name, bases={name: before})
+            if not hunks:
+                return proposal
+            file = next((file for file in proposal["files"] if file["path"] == name), None)
+            if file is None:
+                if len(proposal["files"]) >= 100:
+                    raise ReviewError("A proposal can contain at most 100 files.")
+                file = {"path": name, "base_digest": digest(before), "before": before, "hunks": []}
+                proposal["files"].append(file)
+            file["hunks"].extend(hunks)
+            file["hunks"].sort(key=lambda h: (h["start"], h["end"]))
+            if len(self.render(proposal, "all")[name].encode()) > MAX_SOURCE:
+                raise ReviewError("The combined update is larger than 2 MB.")
+            proposal["revision"] += 1
+            self._save(proposal, "source-edit", f"{name}: {len(hunks)} new changes")
+            return proposal
+
     def create(self, targets: dict[str, str], title: str, rationale: str = "", bases: dict | None = None) -> dict:
         with self.lock:
             if not targets or len(targets) > 100:
@@ -185,17 +311,7 @@ class ReviewStore:
                 before = self.repo.read(name) if bases is None else bases[name]
                 if bases is not None and self.repo.read(name) != before:
                     raise ReviewError(f"{name} changed during patch import. Import it again.", 409)
-                old_lines, new_lines = before.splitlines(keepends=True), after.splitlines(keepends=True)
-                hunks = []
-                for kind, i, j, a, b in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
-                    if kind == "equal":
-                        continue
-                    new = "".join(new_lines[a:b])
-                    hunks.append({"id": uuid.uuid4().hex[:12], "start": i, "end": j,
-                                  "old": "".join(old_lines[i:j]), "new": new, "suggested": new,
-                                  "context_before": "".join(old_lines[max(0, i - 2):i]),
-                                  "context_after": "".join(old_lines[j:j + 2]),
-                                  "decision": "pending", "reason": rationale})
+                hunks = self._hunks(before, after, rationale)
                 if hunks:
                     files.append({"path": name, "base_digest": digest(before), "before": before, "hunks": hunks})
             if not files:

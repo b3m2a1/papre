@@ -95,6 +95,37 @@ class ServerTests(unittest.TestCase):
                 self.post("/api/context", {"files": ["main.tex"]}, token=token, headers=headers)
             self.assertEqual(caught.exception.code, 403)
 
+    def test_source_editor_creates_pending_queue_changes_over_http(self):
+        self.store.allow_write = False
+        file = self.get("/api/file?path=main.tex")
+        region = self.post("/api/source-region", {"path": "main.tex", "line": 3, "base_digest": file["base_digest"]})
+        result = self.post("/api/source-edit", region | {"new": region["before"].replace("Original", "My edit")})
+        self.assertEqual(result["proposal"]["counts"]["pending"], 1)
+        self.assertEqual(self.get("/api/file?path=main.tex")["text"], self.base)
+        changed = self.post("/api/source-region", {"path": "main.tex", "line": 3,
+                            "proposal": result["proposal"]["id"], "revision": result["proposal"]["revision"]})
+        self.assertEqual(changed["hunk"], result["proposal"]["files"][0]["hunks"][0]["id"])
+        extra = self.post("/api/source-region", {"path": "main.tex", "line": 1,
+                          "proposal": result["proposal"]["id"], "revision": result["proposal"]["revision"]})
+        result = self.post("/api/source-edit", extra | {"entry": result["entry"]["id"],
+                           "new": extra["before"].replace("{article}", "[11pt]{article}")})
+        self.assertEqual(result["proposal"]["counts"]["pending"], 2)
+        self.assertTrue(self.server.queue.list()["archives"])
+
+    def test_source_editor_requests_require_token_origin_repository_and_fresh_source(self):
+        region = self.post("/api/source-region", {"path": "main.tex", "line": 3})
+        for endpoint, payload in [("/api/source-region", {"path": "main.tex", "line": 3}),
+                                  ("/api/source-edit", region | {"new": "Changed.\n"})]:
+            for token, headers, code in [("bad", {}, 403), (self.token, {"Origin": "https://other.example"}, 403),
+                                         (self.token, {"X-Repository-Key": "another-repository"}, 409)]:
+                with self.subTest(endpoint=endpoint, headers=headers), self.assertRaises(HTTPError) as caught:
+                    self.post(endpoint, payload, token=token, headers=headers)
+                self.assertEqual(caught.exception.code, code)
+        (self.repo_path / "main.tex").write_text(self.base + "External.\n")
+        with self.assertRaises(HTTPError) as caught:
+            self.post("/api/source-edit", region | {"new": "Stale.\n"})
+        self.assertEqual(caught.exception.code, 409)
+
     def test_import_review_export_and_apply_over_http(self):
         patch = git_patch({"main.tex": (self.base, self.base.replace("Original", "Suggested"))})
         queued = self.post("/api/import", {"patch": patch, "title": "HTTP test"})

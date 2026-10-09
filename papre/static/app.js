@@ -5,6 +5,8 @@ let importFilename = null, warningEntry = null, toastTimer, polling = false, ope
 const drafts = new Map(), editing = new Set(), expanded = new Set();
 let previewRun = null, previewRequests = Promise.resolve(), waitingForPreview = false;
 let focusedChange = null, pdfTarget = '';
+let contextEdit = null, sourceText = '', sourceDigest = null, contextGeneration = 0;
+const unsavedEdits = () => drafts.size || contextEdit && (contextEdit.draft ?? contextEdit.before) !== contextEdit.before;
 function toast(message, error = false) {
   $('#toast').textContent = message; $('#toast').classList.toggle('error', error); $('#toast').hidden = false;
   clearTimeout(toastTimer); toastTimer = setTimeout(() => { $('#toast').hidden = true; }, error ? 10000 : 4000);
@@ -16,8 +18,10 @@ async function api(path, data) {
   if (!response.ok) { const error = new Error(result.error || `Request failed (${response.status})`); error.status = response.status; throw error; }
   return result;
 }
-function safeNavigate() {
-  if (drafts.size && !confirm('Discard the unsaved update edit?')) return false;
+function safeNavigate(allowBusy = false) {
+  if (busy && !allowBusy) return false;
+  if (unsavedEdits() && !confirm('Discard the unsaved update edit?')) return false;
+  contextGeneration++; contextEdit = null;
   drafts.clear(); editing.clear(); expanded.clear(); return true;
 }
 const hunks = () => proposal ? proposal.files.flatMap(file => file.hunks) : [];
@@ -27,7 +31,7 @@ async function refreshSession() {
   const next = await api('/api/session');
   const changedRepo = session && session.repo_key !== next.repo_key;
   session = next;
-  if (changedRepo) { invalidatePreview(); waitingForPreview = false; entry = proposal = sourcePath = null; drafts.clear(); editing.clear(); expanded.clear(); lastBuild = null; clearPreview(); }
+  if (changedRepo) { invalidatePreview(); waitingForPreview = false; entry = proposal = sourcePath = null; contextEdit = null; contextGeneration++; drafts.clear(); editing.clear(); expanded.clear(); lastBuild = null; clearPreview(); }
   $('#repo-path').textContent = session.repo?.root || 'No repository selected';
   $('#branch').textContent = session.repo?.branch || '';
   $('#repo-state').textContent = session.repo ? (session.repo.dirty ? 'Modified' : 'Clean') : '';
@@ -75,6 +79,7 @@ function renderNav() {
   }
 }
 async function openEntry(id) {
+  contextGeneration++; contextEdit = null;
   invalidatePreview();
   const generation = ++queueGeneration; opening++;
   try {
@@ -115,23 +120,24 @@ function renderReview() {
   }
   const counts = proposal.counts;
   $('#review-counts').textContent = `${counts.pending} pending · ${counts.accepted} accepted · ${counts.rejected} rejected`;
-  $('#accept-all').disabled = !active || !counts.pending || busy;
-  $('#reject-all').disabled = !active || !counts.pending || busy;
+  $('#accept-all').disabled = !active || !counts.pending || busy || Boolean(contextEdit);
+  $('#reject-all').disabled = !active || !counts.pending || busy || Boolean(contextEdit);
   if (!valid) {
     const warning = node('div', 'form-error', entry.error || 'This patch cannot apply to the current repository.');
     warning.append(button('Archive', () => archiveEntry(entry.id))); $('#changes').append(warning);
   }
   for (const file of proposal.files) {
     const diff = node('review-diff'); $('#changes').append(diff);
-    diff.model = {file, context: $('#context-size').value, active, busy, drafts, editing, expanded, locations: previewLocations()};
+    diff.model = {file, context: $('#context-size').value, active, busy: busy || Boolean(contextEdit), savingSource: busy,
+      drafts, editing, expanded, contextEdit, locations: previewLocations()};
   }
   $('#apply').hidden = proposal.status !== 'reviewing'; $('#undo').hidden = proposal.status !== 'applied';
-  $('#apply').disabled = !active || busy || !session.allow_write || counts.pending > 0 || counts.accepted === 0 || drafts.size > 0;
-  $('#undo').disabled = busy || !session.allow_write;
+  $('#apply').disabled = !active || busy || !session.allow_write || counts.pending > 0 || counts.accepted === 0 || drafts.size > 0 || Boolean(contextEdit);
+  $('#undo').disabled = busy || !session.allow_write || Boolean(contextEdit);
   $('#export-patch').href = `/api/proposals/${proposal.id}/patch?selection=accepted`;
   $('#apply-summary').textContent = proposal.status === 'applied' ? 'Accepted changes applied' : proposal.status === 'undone' ? 'Apply undone' :
     counts.pending ? `${counts.pending} changes remain` : counts.accepted ? `${counts.accepted} accepted changes · moved to processed` : 'All changes rejected · moved to processed';
-  $('#apply-note').textContent = drafts.size ? 'Save or cancel your update edit.' : !session.allow_write ? 'Apply is disabled. Enable it when attaching the repository.' :
+  $('#apply-note').textContent = drafts.size || contextEdit ? 'Save or cancel your update edit.' : !session.allow_write ? 'Apply is disabled. Enable it when attaching the repository.' :
     proposal.status === 'reviewing' ? 'Review decisions are saved. Manuscript source changes only when you click Apply.' : 'Review history is retained.';
   previewHint();
   updatePdfLocations();
@@ -144,13 +150,13 @@ $('#changes').addEventListener('review-action', event => {
   const {action, id, decision, new: update} = event.detail;
   const hunk = hunks().find(h => h.id === id);
   if (action === 'preview-section') scrollToPdf(id);
-  else if (action === 'edit') { editing.add(id); renderReview(); $(`article[data-hunk="${id}"] textarea`)?.focus(); }
+  else if (action === 'edit') { if (contextEdit) return; editing.add(id); renderReview(); $(`article[data-hunk="${id}"] textarea`)?.focus(); }
   else if (action === 'cancel') { editing.delete(id); drafts.delete(id); renderReview(); }
   else if (action === 'save') updateDecisions([{id, new: update, decision: update === hunk.new ? hunk.decision : 'pending'}]);
   else if (action === 'decision') updateDecisions([{id, decision, ...(drafts.has(id) ? {new: drafts.get(id)} : {})}]);
 });
 async function updateDecisions(decisions) {
-  if (busy) return; busy = true; queueGeneration++;
+  if (busy || contextEdit) return; busy = true; queueGeneration++;
   invalidatePreview();
   try {
     const result = await api(`/api/queue/${entry.id}/review`, {revision: proposal.revision, decisions});
@@ -168,7 +174,7 @@ for (const [id, decision] of [['accept-all', 'accepted'], ['reject-all', 'reject
     ({id: h.id, decision, ...(drafts.has(h.id) ? {new: drafts.get(h.id)} : {})}))));
 }
 for (const action of ['apply', 'undo']) $('#' + action).addEventListener('click', async () => {
-  if (busy) return; busy = true; queueGeneration++; renderReview();
+  if (busy || contextEdit) return; busy = true; queueGeneration++; renderReview();
   try {
     const result = await api(`/api/queue/${entry.id}/${action}`, {revision: proposal.revision});
     entry = result.entry; proposal = result.proposal; await refreshSession();
@@ -206,11 +212,74 @@ $('#warning-skip').addEventListener('click', () => skipEntry(warningEntry).catch
 $('#warning-archive').addEventListener('click', () => archiveEntry(warningEntry));
 $('#context-size').addEventListener('change', renderReview);
 async function showSource(path) {
-  const result = await api('/api/file?path=' + encodeURIComponent(path)); sourcePath = path;
+  const generation = ++contextGeneration, repo = session.repo_key;
+  const result = await api('/api/file?path=' + encodeURIComponent(path));
+  if (generation !== contextGeneration || session.repo_key !== repo) return;
+  sourcePath = path; sourceText = result.text; sourceDigest = result.base_digest; contextEdit = null;
   $('#review-view').hidden = true; $('#source-view').hidden = false;
-  $('#source-title').textContent = path; $('#source-text').text = result.text; renderNav();
+  $('#source-title').textContent = path; renderSource(); renderNav();
 }
-$('#back-review').addEventListener('click', () => { sourcePath = null; renderReview(); renderNav(); });
+function renderSource() {
+  $('#source-text').model = {text: sourceText, path: sourcePath, editable: Boolean(session.repo), contextEdit, busy};
+}
+function renderEditorView() { if (sourcePath) renderSource(); else renderReview(); }
+function focusSourceEditor() {
+  const input = $('source-region-editor textarea');
+  if (!input || !contextEdit) return;
+  input.closest('source-region-editor').scrollIntoView({block: 'center'}); input.focus({preventScroll: true});
+  const position = contextEdit.before.split('\n').slice(0, contextEdit.line - contextEdit.start - 1).join('\n').length;
+  input.setSelectionRange(position ? position + 1 : 0, position ? position + 1 : 0);
+}
+async function beginSourceEdit(path, line, scope = 'paragraph', expectedDigest = null) {
+  if (busy || opening || !session.repo) return;
+  if (scope !== 'section' && !safeNavigate()) return;
+  const generation = ++contextGeneration, repo = session.repo_key;
+  const current = proposal?.status === 'reviewing' && entry?.status !== 'invalid' ? proposal : null;
+  busy = true; renderEditorView();
+  try {
+    const region = await api('/api/source-region', {path, line, scope, proposal: current?.id ?? null, revision: current?.revision ?? null,
+      base_digest: expectedDigest ?? (sourcePath === path ? sourceDigest : null)});
+    if (generation !== contextGeneration || repo !== session.repo_key) return;
+    busy = false;
+    if (region.hunk) {
+      contextEdit = null; sourcePath = null; editing.add(region.hunk); renderReview(); renderNav(); focusReviewSection(region.hunk);
+      $(`article[data-hunk="${region.hunk}"] textarea`)?.focus(); return;
+    }
+    contextEdit = {...region, entry: current ? entry.id : null};
+    renderEditorView(); focusSourceEditor();
+  } catch (error) { toast(error.message, true); }
+  finally { if (busy) { busy = false; renderEditorView(); } }
+}
+async function saveSourceEdit() {
+  if (busy || !contextEdit) return;
+  const region = contextEdit, update = region.draft ?? region.before;
+  if (update === region.before) { contextEdit = null; renderEditorView(); return; }
+  busy = true; queueGeneration++; contextGeneration++; renderEditorView(); invalidatePreview();
+  const previousIds = new Set(hunks().map(hunk => hunk.id));
+  let firstId = null;
+  try {
+    const result = await api('/api/source-edit', {...region, new: update});
+    entry = result.entry; proposal = result.proposal; sourcePath = null; contextEdit = null;
+    sessionStorage.setItem('review-entry:' + session.repo_key, entry.id);
+    $('#preview-selection').value = 'proposed';
+    await refreshSession(); warmPreview();
+    const first = hunks().find(hunk => !previousIds.has(hunk.id));
+    firstId = first?.id;
+    toast('Saved as pending changes. Accept or reject them in the review.');
+  } catch (error) { cancelBackgroundPreview(); toast(error.message, true); }
+  finally { busy = false; renderEditorView(); if (firstId) focusReviewSection(firstId); }
+}
+for (const host of [$('#changes'), $('#source-text')]) {
+  host.addEventListener('edit-source', event => beginSourceEdit(event.detail.path, event.detail.line));
+  host.addEventListener('source-editor-action', event => {
+    if (!contextEdit || busy) return;
+    const action = event.detail.action;
+    if (action === 'cancel') { contextEdit = null; contextGeneration++; renderEditorView(); }
+    else if (action === 'save') saveSourceEdit();
+    else if (action === 'section') beginSourceEdit(contextEdit.path, contextEdit.line, 'section');
+  });
+}
+$('#back-review').addEventListener('click', () => { if (safeNavigate()) { sourcePath = null; renderReview(); renderNav(); } });
 
 let directoryGeneration = 0;
 function renderDirectory(listing) {
@@ -262,7 +331,7 @@ $('#attach-repo').addEventListener('click', async () => {
   $('#attach-repo').disabled = true; $('#repo-error').hidden = true;
   try {
     session = await api('/api/repository', {path: directory.path, allow_write: $('#repo-write').checked});
-    entry = proposal = sourcePath = lastBuild = null; buildGeneration++; drafts.clear(); editing.clear(); expanded.clear();
+    entry = proposal = sourcePath = lastBuild = null; contextEdit = null; contextGeneration++; buildGeneration++; drafts.clear(); editing.clear(); expanded.clear();
     $('#pdf-pages').hidden = $('#pdf-frame').hidden = $('#open-pdf').hidden = $('#pdf-zoom-control').hidden = true;
     $('#build-warning').hidden = true;
     $('#pdf-empty').hidden = false; $('#build-badge').textContent = 'Not compiled'; $('#compile').label = 'Compile preview';
@@ -287,7 +356,7 @@ $('#import-submit').addEventListener('click', async () => {
       rationale: $('#import-reason').value, filename: importFilename});
     $('#import-dialog').close(); $('#patch-input').value = ''; importFilename = null;
     await refreshSession();
-    if (safeNavigate()) await openEntry(queued.id);
+    if (safeNavigate(true)) await openEntry(queued.id);
     toast('Patch added to review_queue.');
   } catch (error) { $('#import-error').textContent = error.message; $('#import-error').hidden = false; }
   finally { busy = false; $('#import-submit').disabled = false; renderReview(); }
@@ -394,7 +463,7 @@ function requestPreview(show = false) {
   return run.promise;
 }
 $('#compile').addEventListener('click', () => {
-  if (drafts.size) { toast('Save or cancel the update edit before compiling.', true); return; }
+  if (unsavedEdits()) { toast('Save or cancel the update edit before compiling.', true); return; }
   $('#preview-settings').close(false);
   $('#toggle-preview-settings').control.focus();
   requestPreview(true);
@@ -425,7 +494,7 @@ function displayBuild(job) {
   const uncolored = (job.changes || []).filter(change => change.decision === 'pending' && change.note).length;
   $('#annotation-note').textContent = 'Pending prose edits are green in Proposed changes; accepted and rejected edits have no review color. ' +
     (uncolored ? `${uncolored} source change(s) could not be colored safely. ` : '') +
-    'Double-click changed text in Rendered pages to return to its review section. Browser PDF uses page fragments; browser support varies. ' +
+    'Double-click text in Rendered pages to review its change or edit surrounding source. Browser PDF uses page fragments; browser support varies. ' +
     (job.warnings || []).filter(warning => /coloring|SyncTeX|locations/.test(warning)).join(' ');
   if (job.status === 'succeeded' || job.status === 'with_errors') {
     $('#build-badge').textContent = job.status === 'with_errors' ? 'Preview with errors' : `${job.seconds}s · Ready`;
@@ -437,9 +506,9 @@ function displayBuild(job) {
     (job.pages || []).forEach((url, index) => { const figure = node('figure', 'pdf-page'), image = node('img');
       image.src = url; image.alt = `PDF page ${index + 1}`; image.loading = index === 0 ? 'eager' : 'lazy';
       image.dataset.page = String(index + 1);
-      if (job.synctex_path && job.changes?.length) {
+      if (job.synctex_path) {
         image.dataset.sourceNavigation = 'true';
-        image.title = 'Double-click changed text to return to its review section';
+        image.title = 'Double-click text to review its change or edit surrounding source';
       }
       figure.append(image, node('figcaption', '', `Page ${index + 1} of ${job.pages.length}`)); $('#pdf-pages').append(figure); });
     $('#pdf-empty').hidden = true; $('#open-pdf').href = job.pdf; $('#open-pdf').hidden = false; selectPdfViewer();
@@ -514,13 +583,21 @@ function focusReviewSection(id) {
 $('#pdf-pages').addEventListener('dblclick', async event => {
   const image = event.target.closest('img[data-source-navigation]');
   const build = lastBuild;
-  if (!image || !build || !Object.keys(previewLocations()).length) return;
+  if (!image || !build || busy) return;
   const bounds = image.getBoundingClientRect();
   try {
     const result = await api(`/api/previews/${build.id}/source`, {page: Number(image.dataset.page),
       x: (event.clientX - bounds.left) / bounds.width, y: (event.clientY - bounds.top) / bounds.height});
-    if (lastBuild?.id !== build.id || proposal?.id !== result.proposal || proposal?.revision !== result.revision) return;
-    focusReviewSection(result.hunk);
+    if (lastBuild?.id !== build.id || build.proposal !== result.proposal || build.revision !== result.revision || !safeNavigate()) return;
+    if (result.hunk && proposal?.id === result.proposal && proposal?.revision === result.revision) {
+      sourcePath = null; renderReview(); focusReviewSection(result.hunk);
+    } else {
+      if ($('.app-layout').classList.contains('pdf-expanded')) $('#expand-preview').click();
+      if (proposal?.status === 'reviewing' && proposal.files.some(file => file.path === result.path)) {
+        sourcePath = null; renderReview();
+      } else await showSource(result.path);
+      await beginSourceEdit(result.path, result.line, 'paragraph', result.base_digest);
+    }
   } catch (error) { toast(error.message); }
 });
 window.addEventListener('hashchange', () => {
@@ -531,7 +608,7 @@ $('#pdf-viewer').addEventListener('change', () => {
   try { localStorage.setItem('papre.pdf-viewer', $('#pdf-viewer').value); } catch { /* Optional preference. */ }
   selectPdfViewer();
 });
-window.addEventListener('beforeunload', event => { if (drafts.size) { event.preventDefault(); event.returnValue = ''; } });
+window.addEventListener('beforeunload', event => { if (unsavedEdits()) { event.preventDefault(); event.returnValue = ''; } });
 setInterval(async () => {
   if (!session?.repo || polling || busy || opening) return;
   polling = true; const generation = queueGeneration;
@@ -540,10 +617,10 @@ setInterval(async () => {
     if (generation !== queueGeneration || busy || opening) return;
     session.queue = queue; renderNav();
     const current = entry && session.queue.entries.find(item => item.id === entry.id);
-    if (current && !sourcePath && !drafts.size && (current.proposal !== (proposal?.id || null) ||
+    if (current && !sourcePath && !drafts.size && !contextEdit && (current.proposal !== (proposal?.id || null) ||
       (current.revision && current.revision !== proposal?.revision))) {
       await openEntry(entry.id);
-    } else if (entry && !current && !drafts.size) {
+    } else if (entry && !current && !drafts.size && !contextEdit) {
       entry = proposal = null; cancelBackgroundPreview(); if (!sourcePath) renderReview();
     }
   } catch { /* A manual refresh reports connection errors without interrupting editing. */ }

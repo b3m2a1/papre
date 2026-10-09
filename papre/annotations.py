@@ -24,6 +24,33 @@ def uncomment(text: str) -> str:
     return "\n".join(lines)
 
 
+def conditional_text_context(prefix: str) -> bool:
+    """Recognize open text branches, without treating arbitrary macro arguments as prose.
+
+    The first argument of ifthen/ifthenelse is a test. Only the second and
+    third arguments may contain locally grouped color commands. Track those
+    argument boundaries through nested groups and nested conditionals.
+    """
+    groups = []
+    argument = None
+    for token in re.findall(r"\\[a-zA-Z@]+\*?|\\.|[{}]|[^\\{}]+|\\$", prefix):
+        if token in {r"\ifthen", r"\ifthenelse"}:
+            argument = 1
+        elif token == "{":
+            groups.append(argument)
+            argument = None
+        elif token == "}":
+            if not groups:
+                return False
+            finished = groups.pop()
+            argument = finished + 1 if finished in {1, 2} else None
+        elif token.strip():
+            # A mandatory argument must immediately follow its command or
+            # preceding argument (apart from spaces/comments).
+            argument = None
+    return bool(groups) and all(group in {2, 3} for group in groups) and argument is None
+
+
 def safe_prose(text: str, prefix: str) -> bool:
     clean = uncomment(text)
     before = uncomment(prefix)
@@ -42,7 +69,10 @@ def safe_prose(text: str, prefix: str) -> bool:
             elif token in {"$", "$$"}:
                 dollars = None if dollars == token else token if dollars is None else "unbalanced"
         return braces, dollars
-    if balance(clean) != (0, None) or balance(before) != (0, None):
+    prefix_balance = balance(before)
+    if balance(clean) != (0, None) or prefix_balance is None or prefix_balance[1] is not None:
+        return False
+    if prefix_balance[0] and not conditional_text_context(before):
         return False
     if clean.count(r"\(") != clean.count(r"\)") or clean.count(r"\[") != clean.count(r"\]"):
         return False

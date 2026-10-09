@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 
-from .core import ReviewError, ReviewStore, timestamp
+from .core import ReviewError, ReviewStore, digest, timestamp
 from .system import ENGINES, available_tools
 from .annotations import review_annotations, sync_records
 
@@ -159,6 +159,7 @@ class PreviewManager:
                 shutil.rmtree(folder)
                 raise
             job = {"id": job_id, "status": "running", "main": main, "engine": engine,
+                   "directory": Path(main).parent.as_posix(),
                    "selection": selection, "proposal": proposal_id, "revision": revision,
                    "strict": strict, "engine_path": tools["engine_paths"][engine], "latexmk_path": tools["latexmk"],
                    "created": timestamp(), "warnings": warnings, "log": "Preparing LaTeX preview…"}
@@ -255,11 +256,12 @@ class PreviewManager:
         job = self.jobs[job_id]
         folder = self.root / job_id
         output = folder / "output"
+        directory = folder / "source" / job["directory"]
         env = dict(os.environ)
         env.update(openin_any="p", openout_any="p", TEXMFOUTPUT=str(output))
         command = [job["latexmk_path"], "-norc", ENGINES[job["engine"]], "-no-shell-escape",
                    "-interaction=nonstopmode", "-halt-on-error" if job["strict"] else "-f", "-file-line-error",
-                   "-synctex=1", "-outdir=" + str(output), "./" + job["main"]]
+                   "-synctex=1", "-outdir=" + str(output), "./" + Path(job["main"]).name]
         started = time.monotonic()
         try:
             self._check_cancelled(job)
@@ -268,7 +270,7 @@ class PreviewManager:
                 self._check_cancelled(job)
                 job["phase"] = "compiling"
             with (folder / "compile.log").open("wb") as log:
-                code, _ = self._run_process(job, command, timeout=self.timeout, cwd=folder / "source", env=env,
+                code, _ = self._run_process(job, command, timeout=self.timeout, cwd=directory, env=env,
                                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
             pdf = output / (Path(job["main"]).stem + ".pdf")
             content = (folder / "compile.log").read_text(encoding="utf-8", errors="replace")
@@ -286,7 +288,7 @@ class PreviewManager:
                     remaining = self.timeout - (time.monotonic() - started)
                     if remaining <= 0:
                         raise ReviewError(f"Preview process exceeded {self.timeout} seconds.")
-                    code, _ = self._run_process(job, command, timeout=remaining, cwd=folder / "source", env=env,
+                    code, _ = self._run_process(job, command, timeout=remaining, cwd=directory, env=env,
                                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
                 content = (folder / "compile.log").read_text(encoding="utf-8", errors="replace")
                 diagnostics, has_pdf = compile_diagnostics(content), complete_pdf(pdf)
@@ -321,7 +323,7 @@ class PreviewManager:
         env = {key: value for key, value in os.environ.items() if key not in {"SYNCTEX_EDITOR", "SYNCTEX_VIEWER"}}
         with tempfile.TemporaryFile(dir=self.root / job["id"]) as stream:
             code, _ = self._run_process(job, [job["synctex_path"], *arguments], timeout=2,
-                                        cwd=self.root / job["id"] / "source", env=env,
+                                        cwd=self.root / job["id"] / "source" / job.get("directory", "."), env=env,
                                         stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.PIPE)
             stream.seek(0)
             return sync_records(stream.read(65536).decode(errors="replace")) if code == 0 else []
@@ -371,11 +373,14 @@ class PreviewManager:
 
     def source_at(self, job_id: str, page: int, x: float, y: float) -> dict:
         job = self.get(job_id)
+        proposal = None
         if job.get("proposal"):
             proposal = self.store.get(job["proposal"])
             if proposal["revision"] != job["revision"]:
                 raise ReviewError("This preview refers to an older review revision. Wait for the current preview.", 409)
             self.store.verify_base(proposal)
+        if job.get("identity") and job["identity"][6] != self._source_stamp():
+            raise ReviewError("Source changed since this preview was compiled. Compile again before editing.", 409)
         if not job.get("synctex_path"):
             raise ReviewError("SyncTeX source navigation is unavailable for this preview.", 409)
         if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= len(job.get("pages", [])):
@@ -396,18 +401,47 @@ class PreviewManager:
             if "Input" not in record or "Line" not in record:
                 continue
             source = Path(record["Input"])
-            source = (source if source.is_absolute() else snapshot / source).resolve()
+            source = (source if source.is_absolute() else snapshot / job.get("directory", ".") / source).resolve()
             if not source.is_relative_to(snapshot.resolve()):
                 continue
             path = str(source.relative_to(snapshot.resolve())).replace(os.sep, "/")
-            line = int(record["Line"]) - job.get("line_offsets", {}).get(path, 0)
-            candidates = [change for change in job.get("changes", []) if change["path"] == path and
-                          change["paragraph_start"] <= line <= max(change["paragraph_end"], change["end_line"])]
-            if candidates:
-                change = min(candidates, key=lambda item: abs(item["line"] - line))
-                return {"proposal": job["proposal"], "revision": job["revision"], "hunk": change["id"],
-                        "path": path, "line": line}
-        raise ReviewError("There is no reviewed change at this PDF location.", 404)
+            try:
+                line = int(record["Line"]) - job.get("line_offsets", {}).get(path, 0)
+                before = self.store.repo.read(path)
+            except (ValueError, ReviewError):
+                continue
+            if line < 1:
+                continue
+            hunk_id, baseline_line = self._baseline_line(proposal, path, line, job["selection"])
+            # SyncTeX sometimes attributes the first line of green text to the
+            # preceding source line. Retain that link only at its PDF baseline,
+            # rather than treating the entire surrounding paragraph as a hunk.
+            nearby = [change for change in job.get("changes", []) if change["path"] == path and
+                      change.get("page") == page and change.get("y") is not None and
+                      abs(change["y"] - y * height * 72 / 120) < 6]
+            if hunk_id is None and nearby:
+                hunk_id = min(nearby, key=lambda c: abs(c["y"] - y * height * 72 / 120))["id"]
+            if baseline_line > max(1, len(before.splitlines())) and hunk_id is None:
+                continue
+            return {"proposal": job["proposal"], "revision": job["revision"], "hunk": hunk_id,
+                    "path": path, "line": baseline_line, "base_digest": digest(before)}
+        raise ReviewError("There is no editable source at this PDF location.", 404)
+
+    @staticmethod
+    def _baseline_line(proposal: dict | None, path: str, line: int, selection: str) -> tuple[str | None, int]:
+        """Undo selected hunk line offsets when mapping unchanged PDF text to source."""
+        file = next((file for file in proposal["files"] if file["path"] == path), None) if proposal else None
+        offset = 0
+        for hunk in file["hunks"] if file else []:
+            included = hunk["decision"] == "accepted" or selection == "proposed" and hunk["decision"] == "pending"
+            length = len((hunk["new"] if included else hunk["old"]).splitlines(keepends=True))
+            first = hunk["start"] + offset + 1
+            if line < first:
+                break
+            if line < first + length:
+                return hunk["id"], hunk["start"] + 1
+            offset += length - (hunk["end"] - hunk["start"])
+        return None, line - offset
 
     def _render_pages(self, job: dict, pdf: Path) -> list[str]:
         """Use installed CLI tools; the original PDF stays available even if rendering fails."""

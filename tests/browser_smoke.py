@@ -216,7 +216,7 @@ def main():
                 page.get_by_role("button", name="PDF preview", exact=True).click()
                 expect(page.locator("#preview-splitter")).not_to_be_visible()
 
-                # Context beyond the patch is expandable, and full source stays read-only.
+                # Context beyond the patch is expandable; source stays unchanged until Apply.
                 page.locator("#context-size").select_option("3")
                 expect(page.locator(".context-gap").first).to_be_visible()
                 page.locator(".context-gap").first.get_by_role("button").click()
@@ -452,6 +452,77 @@ def main():
                 page.get_by_role("button", name="Git status and history", exact=True).click()
                 expect(page.locator("#git-status")).to_contain_text("review_queue/")
                 page.locator("#git-dialog").get_by_role("button", name="Close", exact=True).click()
+
+                # Unchanged update lines become a shared inline editor, then pending hunks.
+                page.locator('#context-size').select_option('all')
+                page.locator('article.hunk').nth(0).get_by_role('button', name='Accept', exact=True).click()
+                expect(page.locator('#review-counts')).to_contain_text('1 accepted')
+                page.locator('article.hunk').nth(1).get_by_role('button', name='Reject', exact=True).click()
+                expect(page.locator('#review-counts')).to_contain_text('1 rejected')
+                review_id = next(row['proposal'] for row in server.queue._rows() if row['path'] == 'External.patch')
+                current = server.store.get(review_id)
+                original_ids = {h['id']: h['decision'] for f in current['files'] for h in f['hunks']}
+                source_line = next(i + 1 for i, text in enumerate(before.splitlines()) if text.startswith('This document contains'))
+                line = page.locator(f'.diff-cell.editable-source[data-source-line="{source_line}"]')
+                line.dblclick()
+                editor = page.locator('source-region-editor')
+                expect(editor).to_be_visible()
+                expect(editor.locator('.region-original textarea')).to_have_count(0)
+                original_region = editor.get_by_role('textbox').input_value()
+                editor.get_by_role('textbox').fill(original_region.replace('This document', 'A discarded document'))
+                expect(page.locator('#accept-all button')).to_be_disabled()
+                editor.get_by_role('button', name='Cancel edit', exact=True).click()
+                expect(editor).to_have_count(0)
+                assert server.store.get(review_id)['revision'] == current['revision']
+                line.press('Enter')
+                editor.get_by_role('button', name='Edit section', exact=True).click()
+                expect(editor.get_by_role('button', name='Edit section', exact=True)).to_have_count(0)
+                expect(editor).to_contain_text('new changes')
+                original_region = editor.get_by_role('textbox').input_value()
+                editor.get_by_role('textbox').fill(original_region.replace('This document contains', 'This demonstration contains'))
+                page.screenshot(path=str(qa / 'edit-surrounding-source.png'), full_page=True)
+                prior_patch = (queue / 'External.patch').read_text()
+                editor.get_by_role('button', name='Save as patch', exact=True).click()
+                expect(page.locator('article.hunk')).to_have_count(4)
+                expect(editor).to_have_count(0)
+                current = server.store.get(review_id)
+                saved_ids = {h['id']: h['decision'] for f in current['files'] for h in f['hunks']}
+                assert all(saved_ids[key] == decision for key, decision in original_ids.items())
+                assert any(p.read_text() == prior_patch for p in (queue / 'superseded').glob('*.patch'))
+                assert (repo_path / 'main.tex').read_text() == before
+                fresh_id = next(key for key in saved_ids if key not in original_ids)
+                expect(page.locator(f'article[data-hunk="{fresh_id}"] .decision')).to_have_text('pending')
+                expect(page.locator('#build-badge')).to_contain_text('Ready', timeout=45000)
+
+                # A rendered PDF click outside every hunk also opens the source editor.
+                job = server.previews.get(server.previews.latest)
+                open_settings()
+                page.locator('#pdf-viewer').select_option('pages')
+                page.get_by_role('button', name='Compilation settings', exact=True).click()
+                target_line = next(i + 1 for i, text in enumerate(before.splitlines()) if text.startswith('The model uses'))
+                records = server.previews._sync(job, ['view', '-i', f'{target_line + job["line_offsets"].get("main.tex", 0)}:0:{server.previews.root / job["id"] / "source/main.tex"}', '-o', str(server.previews.pdf(job['id']))])
+                location = next(r for r in records if float(r.get('H', '0')) > 0 and float(r.get('W', '0')) > 0)
+                image = page.locator(f'#pdf-pages img[data-page="{location["Page"]}"]')
+                image.evaluate('image => image.decode()')
+                factor = image.bounding_box()['width'] / image.evaluate('image => image.naturalWidth') * 120 / 72
+                image.dblclick(position={'x': (float(location['x']) + 4) * factor, 'y': (float(location['y']) - 2) * factor})
+                expect(editor).to_be_visible()
+                assert 'illustrative temperature' in editor.get_by_role('textbox').input_value()
+                editor.get_by_role('button', name='Cancel edit', exact=True).click()
+                page.locator(f'article[data-hunk="{fresh_id}"]').get_by_role('button', name='Reject', exact=True).click()
+                expect(page.locator(f'article[data-hunk="{fresh_id}"] .decision')).to_have_text('rejected')
+
+                # The full-file view can add a file outside the original patch.
+                page.locator('#file-list').get_by_role('button', name='references.bib', exact=True).click()
+                page.locator('#source-text .source-row').nth(2).dblclick()
+                expect(editor).to_be_visible()
+                region_text = editor.get_by_role('textbox').input_value()
+                editor.get_by_role('textbox').fill(region_text.replace('Synthetic demonstration notes', 'Synthetic example notes'))
+                editor.get_by_role('button', name='Save as patch', exact=True).click()
+                expect(page.locator('article.hunk')).to_have_count(5)
+                assert (repo_path / 'references.bib').read_text() == (DEMO / 'references.bib').read_text()
+                expect(page.locator('#build-badge')).to_contain_text('Ready', timeout=45000)
+
                 page.set_viewport_size({"width": 390, "height": 844})
                 open_settings()
                 page.locator("#pdf-viewer").select_option("browser")
@@ -470,7 +541,7 @@ def main():
                 assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "Mobile viewport overflows"
                 assert not errors, errors
                 browser.close()
-            print("Browser workflow passed: directory selection, queue import, split diff, full context, edit/reject, backups, persistence, PDF, panel resizing, sidebar toggle, expanded PDF, compact toolbar, settings overlay and dismissal, edge-to-edge iframe, apply/undo, skip/archive, external discovery, mobile.")
+            print("Browser workflow passed: directory selection, queue import, split diff, full context, edit/reject, surrounding source edits and cancellation, existing decision preservation, PDF-to-source editing, additional file edits, backups, persistence, PDF, panel resizing, sidebar toggle, expanded PDF, compact toolbar, settings overlay and dismissal, edge-to-edge iframe, apply/undo, skip/archive, external discovery, mobile.")
             print(f"Screenshots: {qa}")
         finally:
             server.shutdown()

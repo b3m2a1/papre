@@ -55,3 +55,5 @@ ui-drawer[popover]{position:fixed;inset:auto;margin:0;padding:0;border:0}
 .pdf-expanded .preview-pane{width:100%;height:calc(100dvh - var(--toolbar-height,52px));position:static}
 @media(max-width:900px){#preview-splitter{display:none}}
 @media(max-width:650px){ui-splitter{display:none}.pdf-expanded .preview-pane{border-top:0}}
+.editable-source{cursor:text}.editable-source:hover{background:#f6f8fa}.editable-source:focus-visible{outline:2px solid var(--blue);outline-offset:-2px}
+source-region-editor{display:block}.source-region{border-top:1px solid var(--border);border-bottom:1px solid var(--border);background:#fff}.source-region .hunk-toolbar{flex-wrap:wrap}.source-region .region-original{min-width:0;background:#fff}.region-label{font-size:11px;font-weight:600;padding:8px 12px;color:var(--muted)}.source-region .editor-update{background:#f6f8fa}.source-region textarea{max-height:65vh}.source-region .muted{margin:8px 0 0}.source-region .hunk-toolbar .muted{margin:0}.source-region .diff-cell{grid-template-columns:42px 12px minmax(0,1fr)}

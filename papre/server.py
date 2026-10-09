@@ -11,7 +11,7 @@ import shutil
 import threading
 from urllib.parse import parse_qs, urlsplit
 
-from .core import Repository, ReviewError, ReviewStore, run_git
+from .core import Repository, ReviewError, ReviewStore, digest, run_git
 from .preview import PreviewManager
 from .queue import PatchQueue
 from .picker import pick_directory
@@ -216,7 +216,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not store:
                     raise ReviewError("Choose a repository first.", 409)
                 name = query.get("path", [""])[0]
-                return self.send({"path": name, "text": store.repo.read(name)})
+                text = store.repo.read(name)
+                return self.send({"path": name, "text": text, "base_digest": digest(text)})
             if path == "/api/proposals":
                 return self.send(store.list() if store else [])
             if path == "/api/events":
@@ -278,6 +279,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(self.server.attach(data.get("path"), data.get("allow_write", False), data.get("main", "main.tex")))
             if not store:
                 raise ReviewError("Choose a repository first.", 409)
+            if path == "/api/source-region":
+                return self.send(store.source_region(data.get("path"), data.get("line"), data.get("proposal"),
+                                                     data.get("revision"), data.get("scope", "paragraph"), data.get("base_digest")))
+            if path == "/api/source-edit":
+                return self.send(self.server.queue.edit_source(data))
             if path == "/api/import":
                 title, rationale = data.get("title", ""), data.get("rationale", "")
                 if not isinstance(title, str) or not isinstance(rationale, str):

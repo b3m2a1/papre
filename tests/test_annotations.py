@@ -46,6 +46,45 @@ class AnnotationTests(unittest.TestCase):
             with self.subTest(text=text, prefix=prefix):
                 self.assertFalse(safe_prose(text, prefix))
 
+    def test_prose_in_conditional_text_branches_can_be_colored(self):
+        for prefix in [
+                "\\ifthenelse{\\equal{\\pageLimit}{5}}{%\n",
+                "\\ifthenelse{\\equal{\\pageLimit}{5}}{%\n\n}{%\n\n",
+                "\\ifthen{test}{True prose with \\textbf{balanced braces}.}{\n",
+                "\\ifthenelse{test}{\\ifthenelse{nested}{\n",
+                "\\ifthenelse{test}{\\ifthenelse{nested}{First branch.}{\n",
+                "\\ifthenelse{test}{An escaped \\{ and 20\\% value. % ignored }\n",
+                "\\ifthenelse % first argument\n {test} % second argument\n {} % third argument\n {\n"]:
+            with self.subTest(prefix=prefix):
+                self.assertTrue(safe_prose("Pending prose with $x^{2}$ and \\emph{emphasis}.\n", prefix))
+        # Nested condition tests, definitions and other argument types stay guarded.
+        for prefix in ["\\ifthenelse{\\equal{", "\\ifthenelse{test}{\\textbf{",
+                       "\\ifthenelse{test}{\\unknown{", "\\textbf{\\ifthenelse{test}{",
+                       "\\ifthenelse{test}{\\ifthenelse{\\equal{value}{",
+                       "\\ifthenelse{test}{Text with $unfinished math.\n",
+                       "\\newcommand{\\example}{\\ifthenelse{test}{",
+                       "\\ifthenelse{test}{\\ifthenelse{nested}"]:
+            with self.subTest(prefix=prefix):
+                self.assertFalse(safe_prose("Pending prose.\n", prefix))
+
+    def test_conditional_annotations_preserve_branch_controls_and_line_mapping(self):
+        before = "\\ifthenelse{\\equal{\\pageLimit}{5}}{%\n\n}{%\n\nOriginal paragraph. % trailing comment\nUnchanged continuation.\n}\n"
+        proposal = {"files": [{"path": "body.tex", "before": before, "hunks": [
+            {"id": "branch", "start": 4, "end": 5, "old": "Original paragraph. % trailing comment\n",
+             "new": "Pending paragraph. % trailing comment\n", "decision": "pending"}]}]}
+        outputs, changes = review_annotations(proposal, "proposed")
+        self.assertTrue(changes[0]["highlighted"])
+        self.assertEqual(changes[0]["line"], 5)
+        self.assertEqual(outputs["body.tex"].count("\n"), before.count("\n"))
+        self.assertIn("Pending paragraph. }% trailing comment", outputs["body.tex"])
+        self.assertEqual(outputs["body.tex"].splitlines()[:4], before.splitlines()[:4])
+        self.assertTrue(outputs["body.tex"].endswith("Unchanged continuation.\n}\n"))
+        for decision in ("accepted", "rejected"):
+            proposal["files"][0]["hunks"][0]["decision"] = decision
+            outputs, changes = review_annotations(proposal, "proposed")
+            self.assertFalse(changes[0]["highlighted"])
+            self.assertEqual(outputs, ReviewStore.render(proposal, "proposed"))
+
     def test_only_pending_prose_is_colored(self):
         file = {"path": "body.tex", "before": "Original.\n\nSecond.\n", "hunks": [
             {"id": "one", "start": 0, "end": 1, "old": "Original.\n", "new": "Proposed.\n", "decision": "pending"},
@@ -148,6 +187,73 @@ class AnnotatedPreviewTests(unittest.TestCase):
         self.assertFalse(job["marked"])
         self.assertFalse(green_in_pdf(self.manager.pdf(job["id"])))
         self.assertTrue(any("coloring was disabled" in w for w in job["warnings"]))
+
+    def test_true_false_and_nested_conditional_prose_compiles_with_local_color(self):
+        main = ("\\documentclass{article}\n\\usepackage{ifthen}\n"
+                "\\newcommand{\\ifthen}[3]{\\ifthenelse{#1}{#2}{#3}}\n"
+                "\\begin{document}\n\\input{body}\n\\end{document}\n")
+        body = ("\\section{Conditional prose}\n"
+                "\\ifthenelse{\\equal{a}{a}}{%\nOriginal true paragraph.\n}{%\nHidden false paragraph.\n}\n\n"
+                "\\ifthenelse{\\equal{a}{b}}{%\nHidden true paragraph.\n}{%\n\n"
+                "Original false paragraph. % keep this comment\n\n"
+                "\\ifthenelse{\\equal{a}{a}}{%\nOriginal nested paragraph.\n}{Unused nested paragraph.}\n}\n\n"
+                "\\ifthen{\\equal{a}{a}}{%\nOriginal alias paragraph.\n}{Unused alias paragraph.}\n\n"
+                "Unchanged prose after every conditional.\n")
+        root = self.store.repo.root
+        (root / "main.tex").write_text(main)
+        (root / "body.tex").write_text(body)
+        after = body.replace("Original true", "Pending true").replace("Original false", "Pending false")
+        after = after.replace("Original nested", "Pending nested").replace("Original alias", "Pending alias")
+        self.proposal = self.store.create({"body.tex": after}, "Conditional prose coloring")
+        job = self.compile()
+        self.assertTrue(all(c["highlighted"] for c in job["changes"]))
+        self.assertTrue(job["marked"])
+        self.assertTrue(green_in_pdf(self.manager.pdf(job["id"])))
+        self.assertFalse(any("coloring was disabled" in warning for warning in job["warnings"]))
+        marked = (self.manager.root / job["id"] / "source/body.tex").read_text()
+        self.assertEqual(marked.count("\n"), body.count("\n"))
+        self.assertIn("Unchanged prose after every conditional.", marked)
+        self.assertNotIn("\\color", self.store.patch(self.proposal))
+        self.assertEqual((root / "main.tex").read_text(), main)
+        self.assertEqual((root / "body.tex").read_text(), body)
+        self.proposal = self.store.update(self.proposal["id"], self.proposal["revision"], [
+            {"id": change["id"], "decision": "accepted" if i == 0 else "rejected"}
+            for i, change in enumerate(job["changes"])])
+        job = self.compile()
+        self.assertFalse(green_in_pdf(self.manager.pdf(job["id"])))
+        self.assertFalse(job["marked"])
+        # Color in an unselected branch must not activate that branch or reach the PDF.
+        self.proposal = self.store.create({"body.tex": body.replace("Hidden false", "Pending hidden false")}, "Hidden branch")
+        job = self.compile()
+        self.assertTrue(job["changes"][0]["highlighted"])
+        self.assertFalse(green_in_pdf(self.manager.pdf(job["id"])))
+        self.assertEqual((root / "body.tex").read_text(), body)
+
+    @unittest.skipUnless(PreviewManager.available().get("synctex") and PreviewManager.available()["renderer"], "Source navigation tools unavailable")
+    def test_unchanged_pdf_text_maps_back_through_review_offsets(self):
+        job = self.compile()
+        original = self.original.decode()
+        line = next(i + 1 for i, text in enumerate(original.splitlines()) if text.startswith("The model uses"))
+        hunks = self.proposal["files"][0]["hunks"]
+        offset = sum(len(h["new"].splitlines()) - (h["end"] - h["start"]) for h in hunks if h["start"] < line - 1)
+        source = self.manager.root / job["id"] / "source/main.tex"
+        records = self.manager._sync(job, ["view", "-i", f"{line + offset + job['line_offsets'].get('main.tex', 0)}:0:{source}",
+                                          "-o", str(self.manager.pdf(job["id"]))])
+        record = next(r for r in records if float(r.get("H", "0")) > 0 and float(r.get("W", "0")) > 0)
+        import struct
+        width, height = struct.unpack(">II", self.manager.page(job["id"], record["Page"]).read_bytes()[16:24])
+        result = self.manager.source_at(job["id"], int(record["Page"]), (float(record["x"]) + 4) * 120 / 72 / width,
+                                        (float(record["y"]) - 2) * 120 / 72 / height)
+        self.assertIsNone(result["hunk"])
+        region = self.store.source_region(result["path"], result["line"], self.proposal["id"], self.proposal["revision"],
+                                         expected_digest=result["base_digest"])
+        self.assertIn("illustrative temperature", region["before"])
+        self.assertNotIn("\\color", region["before"])
+        # A working-tree build has no proposal baseline to guard it; its source stamp still must match.
+        with patch.object(self.manager, "get", return_value=job | {"proposal": None, "revision": None, "selection": "working"}):
+            (self.store.repo.root / "main.tex").write_bytes(self.original + b"% external change\n")
+            with self.assertRaisesRegex(ReviewError, "Source changed since this preview"):
+                self.manager.source_at(job["id"], 1, .5, .5)
 
 
 if __name__ == "__main__":

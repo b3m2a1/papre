@@ -245,6 +245,19 @@ class PatchQueue:
             raise ReviewError("The queue file changed externally. Reload it before continuing.", 409)
 
     def review(self, entry_id: str, revision: int, decisions: list[dict]) -> dict:
+        return self._modify(entry_id, lambda before: self.store.update(before["id"], revision, decisions))
+
+    def edit_source(self, data: dict) -> dict:
+        with self.store.lock:
+            if data.get("entry") is not None:
+                return self._modify(data["entry"], lambda before: self.store.edit_source(data, before["id"], data.get("revision")))
+            proposal = self.store.edit_source(data)
+            row = self.get(self.enqueue(self.store.patch(proposal, "all"), proposal["title"])["id"])
+            row.update(proposal=proposal["id"], status="reviewing")
+            self._save(row)
+            return {"entry": self._summary(row), "proposal": self._public(proposal), "warning": None}
+
+    def _modify(self, entry_id: str, operation) -> dict:
         with self.store.lock:
             row = self.get(entry_id)
             self._current(row)
@@ -253,7 +266,7 @@ class PatchQueue:
             before = self.store.get(row["proposal"])
             original_row = row.copy()
             self.store.verify_base(before)
-            proposal = self.store.update(before["id"], revision, decisions)
+            proposal = operation(before)
             try:
                 self._sync(row, proposal)
             except Exception:

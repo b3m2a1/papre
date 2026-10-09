@@ -198,6 +198,51 @@ function cell(text, number, mark = '', kind = '') {
   element.append(text === null ? node('span', 'code', ' ') : code(text));
   return element;
 }
+function editableLine(element, path, line) {
+  element.classList.add('editable-source'); element.dataset.sourceLine = String(line);
+  element.title = 'Double-click or press Enter to edit surrounding source'; element.tabIndex = 0;
+  element.setAttribute('role', 'button'); element.setAttribute('aria-label', `Edit source around line ${line} in ${path}`);
+  const edit = () => element.dispatchEvent(new CustomEvent('edit-source', {bubbles: true, detail: {path, line}}));
+  element.addEventListener('dblclick', edit);
+  element.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === 'F2') { event.preventDefault(); edit(); }
+  });
+}
+class SourceRegionEditor extends HTMLElement {
+  set model(value) {
+    this.data = value;
+    const {region, busy} = value, wrapper = node('section', 'source-region');
+    const toolbar = node('div', 'hunk-toolbar'), actions = node('div', 'hunk-actions');
+    toolbar.append(node('span', 'muted', `${region.path} · lines ${region.start + 1}–${Math.max(region.start + 1, region.end)} · new changes`));
+    if (region.scope !== 'section') {
+      const more = button('Edit section', () => this.emit('section'));
+      more.disabled = busy || (region.draft ?? region.before) !== region.before;
+      more.title = 'Include more surrounding source, stopping at existing changes'; actions.append(more);
+    }
+    toolbar.append(actions); wrapper.append(toolbar);
+    const row = node('div', 'diff-editor-row'), left = node('div', 'region-original'), right = node('div', 'editor-update');
+    left.append(node('div', 'region-label', 'Original · read-only'));
+    splitLines(region.before).forEach((text, i) => left.append(cell(text, region.start + i + 1)));
+    const field = node('ui-field'); field.setAttribute('label', 'Edit update');
+    const input = node('textarea', 'update-editor'); input.spellcheck = false; input.disabled = busy;
+    input.setAttribute('aria-label', `New patch for ${region.path}`); input.value = region.draft ?? region.before;
+    input.rows = Math.max(8, Math.min(24, splitLines(input.value).length + 2));
+    input.addEventListener('input', () => {
+      region.draft = input.value;
+      if (actions.firstChild) actions.firstChild.disabled = input.value !== region.before;
+      this.emit('input');
+    }); field.append(input); right.append(field);
+    right.append(node('p', 'muted', 'Save creates pending changes in the review queue. The manuscript stays unchanged.'));
+    const buttons = node('div', 'editor-actions');
+    for (const [label, action] of [['Cancel edit', 'cancel'], ['Save as patch', 'save']]) {
+      const control = button(label, () => this.emit(action), action === 'save' ? 'primary' : 'default');
+      control.disabled = busy; buttons.append(control);
+    }
+    right.append(buttons); row.append(left, right); wrapper.append(row); this.replaceChildren(wrapper);
+  }
+  emit(action) { this.dispatchEvent(new CustomEvent('source-editor-action', {bubbles: true, detail: {action}})); }
+}
+customElements.define('source-region-editor', SourceRegionEditor);
 class ReviewDiff extends HTMLElement {
   set model(value) { this.data = value; this.render(); }
   set locations(value) { this.data.locations = value; this.updateLocations(); }
@@ -218,7 +263,7 @@ class ReviewDiff extends HTMLElement {
   }
   render() {
     if (!this.data) return;
-    const {file, context, active, busy, drafts, editing, expanded} = this.data;
+    const {file, context, active, busy, drafts, editing, expanded, contextEdit} = this.data;
     const wrapper = node('section', 'file-diff'), header = node('div', 'file-header');
     header.append(node('strong', '', file.path), button('Open full file', () => {
       this.dispatchEvent(new CustomEvent('open-source', {bubbles: true, detail: file.path}));
@@ -229,9 +274,17 @@ class ReviewDiff extends HTMLElement {
     const equal = (start, end, prefix, suffix) => {
       const count = end - start;
       if (!count) return;
+      const region = contextEdit?.path === file.path && contextEdit.start >= start && contextEdit.end <= end ? contextEdit : null;
       const key = `${file.path}:${start}:${end}`, full = context === 'all' || expanded.has(key), n = Number(context);
-      const ranges = full ? [[start, end]] : prefix ? [[Math.max(start, end - n), end]] : suffix ? [[start, Math.min(end, start + n)]] :
+      let ranges = full ? [[start, end]] : prefix ? [[Math.max(start, end - n), end]] : suffix ? [[start, Math.min(end, start + n)]] :
         count <= 2 * n ? [[start, end]] : [[start, start + n], [end - n, end]];
+      if (region) {
+        const visible = [...ranges, [region.start, region.end]].sort((a, b) => a[0] - b[0]); ranges = [];
+        for (const range of visible) {
+          const last = ranges.at(-1);
+          if (last && last[1] >= range[0]) last[1] = Math.max(last[1], range[1]); else ranges.push(range);
+        }
+      }
       let pos = start;
       const gap = (a, b) => {
         if (b <= a) return;
@@ -241,7 +294,13 @@ class ReviewDiff extends HTMLElement {
       for (const [a, b] of ranges) {
         gap(pos, a);
         for (let i = a; i < b; i++) {
-          const row = node('div', 'diff-row'); row.append(cell(base[i], i + 1), cell(base[i], i + offset + 1)); wrapper.append(row);
+          if (region && i === region.start) {
+            const editor = node('source-region-editor'); wrapper.append(editor); editor.model = {region, busy: this.data.savingSource};
+            i = region.end - 1; continue;
+          }
+          const row = node('div', 'diff-row'), update = cell(base[i], i + offset + 1);
+          if (active && !busy) editableLine(update, file.path, i + 1);
+          row.append(cell(base[i], i + 1), update); wrapper.append(row);
         }
         pos = b;
       }
@@ -295,11 +354,23 @@ class ReviewDiff extends HTMLElement {
 }
 customElements.define('review-diff', ReviewDiff);
 class SourceViewer extends HTMLElement {
-  set text(value) {
+  set text(value) { this.model = {text: value}; }
+  set model(value) {
+    this.data = value;
+    const {text, path, editable, contextEdit, busy} = value;
     const block = node('div', 'source-lines');
-    splitLines(value).forEach((text, index) => {
-      const row = node('div', 'source-row'); row.append(node('span', 'line-number', index + 1), code(text)); block.append(row);
-    }); this.replaceChildren(block);
+    const lines = splitLines(text);
+    for (let index = 0; index < Math.max(1, lines.length); index++) {
+      if (contextEdit && index === contextEdit.start) {
+        const editor = node('source-region-editor'); block.append(editor); editor.model = {region: contextEdit, busy};
+        if (contextEdit.end > index) { index = contextEdit.end - 1; continue; }
+        if (!lines.length) break;
+      }
+      const row = node('div', 'source-row'); row.append(node('span', 'line-number', index + 1), code(lines[index] ?? ''));
+      if (editable && !busy && !contextEdit) editableLine(row, path, index + 1);
+      block.append(row);
+    }
+    this.replaceChildren(block);
   }
 }
 customElements.define('source-viewer', SourceViewer);

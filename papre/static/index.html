@@ -16,7 +16,7 @@
 <main class="workspace">
 <section class="review-pane">
 <div id="review-view"><div class="patch-heading"><div><h1 id="proposal-title">Choose a repository to review patches</h1><p id="proposal-info">Patches are read from review_queue in the selected repository.</p></div><div class="patch-actions"><ui-button id="skip" label="Skip" hidden></ui-button><ui-button id="next" label="Next patch" hidden></ui-button></div></div><p id="proposal-rationale" hidden></p><div id="review-toolbar" class="review-toolbar" hidden><span id="review-counts"></span><ui-field label="Context"><select id="context-size"><option value="3">3 lines</option><option value="10" selected>10 lines</option><option value="30">30 lines</option><option value="all">Full file</option></select></ui-field><span class="toolbar-spacer"></span><ui-button id="accept-all" label="Accept pending" variant="accept"></ui-button><ui-button id="reject-all" label="Reject pending" variant="reject"></ui-button></div><div id="changes"><p class="empty-state">Choose a local Git repository. Drop .patch, .diff, or .json files into its review_queue folder, or use Import LLM patch.</p></div><footer id="apply-bar" class="apply-bar" hidden><div><strong id="apply-summary"></strong><span id="apply-note"></span></div><span class="toolbar-spacer"></span><a id="export-patch" class="ui-link-button" download="reviewed.patch">Export accepted patch</a><ui-button id="undo" label="Undo apply" hidden></ui-button><ui-button id="apply" label="Apply accepted changes" variant="primary" disabled></ui-button></footer></div>
-<div id="source-view" hidden><div class="patch-heading"><h1 id="source-title"></h1><ui-button id="back-review" label="Back to patch"></ui-button></div><p class="muted">Current repository content. Read-only.</p><source-viewer id="source-text"></source-viewer></div>
+<div id="source-view" hidden><div class="patch-heading"><h1 id="source-title"></h1><ui-button id="back-review" label="Back to patch"></ui-button></div><p class="muted">Double-click a line to edit its surrounding source as a new review patch. Original source stays unchanged until Apply.</p><source-viewer id="source-text"></source-viewer></div>
 </section>
 <ui-splitter id="preview-splitter" label="PDF preview width" aria-controls="preview-pane" hidden></ui-splitter>
 <aside id="preview-pane" class="preview-pane" hidden>
@@ -46,7 +46,7 @@
         <ui-field label="Compilation"><label class="checkbox-label"><input id="compile-strict" type="checkbox"> Stop on first error</label></ui-field>
         <ui-button id="compile" label="Compile preview" disabled></ui-button>
         <p id="preview-note" class="muted"></p>
-        <p id="annotation-note" class="muted">Pending prose edits appear in green in Proposed changes. Accepted and rejected edits have no review color. Double-click changed text in Rendered pages to return to its review section; Browser PDF supports page jumps when the browser honors PDF fragments.</p>
+        <p id="annotation-note" class="muted">Pending prose edits appear in green in Proposed changes. Accepted and rejected edits have no review color. Double-click text in Rendered pages to review its change or edit surrounding source; Browser PDF supports page jumps when the browser honors PDF fragments.</p>
         <p id="compiler-status" class="muted"></p>
         <a id="latex-install" target="_blank" rel="noopener">LaTeX setup help</a>
         <ui-button id="toggle-log" label="Show log"></ui-button>
